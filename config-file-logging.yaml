@@ -1,0 +1,110 @@
+# otelcol-ads collector configuration – writes to local log files.
+#
+# Run the collector:
+#   ./dist/otelcol-ads --config config-file-logging.yaml
+
+extensions:
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+receivers:
+  # ---------------------------------------------------------------------------
+  # ADS Logs receiver – reads from the TwinCAT OtelBridge log ring buffer.
+  # ---------------------------------------------------------------------------
+  adsevents:
+    target_net_id: "192.168.1.1.1.1"   # AMS Net ID of the TwinCAT system
+    # router_addr: "192.168.1.1"        # Set for direct TCP (no local TwinCAT router)
+    router_port: 48898
+    plc_port: 851
+    log_ring_symbol: "OtelBridge.LogRing"
+    state_polling_interval: 2s
+    subscription_cycle_time: 100ms
+
+  # ---------------------------------------------------------------------------
+  # ADS Metrics receiver – two complementary paths.
+  # ---------------------------------------------------------------------------
+  adsmetrics:
+    target_net_id: "192.168.1.1.1.1"
+    # router_addr: "192.168.1.1"
+    router_port: 48898
+    plc_port: 851
+    state_polling_interval: 2s
+
+    # Pull path – subscribe to named PLC symbols directly.
+    subscriptions:
+      - symbol: "MAIN.temperature"
+        name: "plc.reactor.temperature"
+        unit: "Cel"
+        description: "Reactor temperature sensor"
+        type: gauge
+        cycle_time: 500ms
+        send_on_change: true
+
+      - symbol: "MAIN.production_count"
+        name: "plc.production.items_total"
+        unit: "{items}"
+        description: "Total items produced since PLC start"
+        type: counter
+        cycle_time: 1s
+        send_on_change: true
+
+      - symbol: "MAIN.conveyor_speed"
+        name: "plc.conveyor.speed"
+        unit: "mm/s"
+        description: "Conveyor belt speed"
+        type: gauge
+        cycle_time: 200ms
+        send_on_change: true
+
+    # Push path – reads from the TwinCAT OtelBridge lock-free metric ring.
+    push_ring:
+      enabled: false
+      symbol: "OtelBridge.MetricRing"
+      subscription_cycle_time: 100ms
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+  batch:
+    send_batch_size: 1000
+    timeout: 1s
+
+exporters:
+  # Write logs to a local file in OTLP JSON format.
+  file/logs:
+    path: ./logs/ads-logs.jsonl
+    rotation:
+      max_megabytes: 64
+      max_days: 7
+      max_backups: 5
+      localtime: true
+
+  # Write metrics to a separate local file in OTLP JSON format.
+  file/metrics:
+    path: ./logs/ads-metrics.jsonl
+    rotation:
+      max_megabytes: 64
+      max_days: 7
+      max_backups: 5
+      localtime: true
+
+  # Print everything to stdout for local development / debugging.
+  debug:
+    verbosity: detailed
+
+service:
+  extensions: [zpages]
+
+  pipelines:
+    logs:
+      receivers: [adsevents]
+      processors: [memory_limiter, batch]
+      exporters: [file/logs, debug]
+
+    metrics:
+      receivers: [adsmetrics]
+      processors: [memory_limiter, batch]
+      exporters: [file/metrics, debug]

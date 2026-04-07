@@ -1,0 +1,35 @@
+# OpenTelemetry Collector Builder configuration.
+#
+# Build the custom collector binary:
+#   go install go.opentelemetry.io/collector/cmd/builder@v0.149.0
+#   builder --config builder-config.yaml
+#
+# Output: ./dist/otelcol-ads  (Windows: ./dist/otelcol-ads.exe)
+
+dist:
+  name: otelcol-ads
+  description: "Custom OTel Collector for TwinCAT ADS – nepionic"
+  output_path: ./dist
+  otelcol_version: "0.149.0"
+
+extensions:
+  - gomod: go.opentelemetry.io/collector/extension/zpagesextension v0.149.0
+
+receivers:
+  - gomod: github.com/nepionic/otelcol-ads v0.1.0
+    import: github.com/nepionic/otelcol-ads/receiver/adslogsreceiver
+    name: adslogsreceiver
+    path: ./
+
+  - gomod: github.com/nepionic/otelcol-ads v0.1.0
+    import: github.com/nepionic/otelcol-ads/receiver/adsmetricsreceiver
+    name: adsmetricsreceiver
+    path: ./
+
+exporters:
+  - gomod: go.opentelemetry.io/collector/exporter/otlpexporter v0.149.0
+  - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.149.0
+
+processors:
+  - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.149.0
+  - gomod: go.opentelemetry.io/collector/processor/memorylimiterprocessor v0.149.0

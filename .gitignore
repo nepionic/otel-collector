@@ -1,0 +1,31 @@
+# Binaries
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test output
+*.test
+*.out
+coverage.html
+coverage.txt
+
+# Go build cache (not needed, but some tools write here)
+vendor/
+
+# Local collector configs with real credentials
+config.yaml
+config-local.yaml
+
+# Log output from local runs
+logs/
+
+# Editor / OS
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+Thumbs.db
+.DS_Store
