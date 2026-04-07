@@ -36,6 +36,13 @@ type Config struct {
 	// SubscriptionCycleTime is the ADS notification cycle time used for the
 	// write_index subscription (default: 100ms).
 	SubscriptionCycleTime time.Duration `mapstructure:"subscription_cycle_time"`
+
+	// ConnectRetryInitialInterval is the first backoff interval after a failed
+	// connection attempt (default: 1s).
+	ConnectRetryInitialInterval time.Duration `mapstructure:"connect_retry_initial_interval"`
+
+	// ConnectRetryMaxInterval caps the exponential backoff (default: 30s).
+	ConnectRetryMaxInterval time.Duration `mapstructure:"connect_retry_max_interval"`
 }
 
 var _ component.Config = (*Config)(nil)

@@ -68,6 +68,13 @@ type Config struct {
 
 	// PushRing configures the push ring buffer path.
 	PushRing PushRingConfig `mapstructure:"push_ring"`
+
+	// ConnectRetryInitialInterval is the first backoff interval after a failed
+	// connection attempt (default: 1s).
+	ConnectRetryInitialInterval time.Duration `mapstructure:"connect_retry_initial_interval"`
+
+	// ConnectRetryMaxInterval caps the exponential backoff (default: 30s).
+	ConnectRetryMaxInterval time.Duration `mapstructure:"connect_retry_max_interval"`
 }
 
 var _ component.Config = (*Config)(nil)

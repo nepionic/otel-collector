@@ -79,9 +79,26 @@ func (mc *ManagedClient) Connect() error {
 	return mc.inner.Connect()
 }
 
+// Reset recreates the underlying ads.Client so a clean retry can be attempted
+// after a failed or partially-failed Connect. Must only be called when the
+// previous client is no longer connected.
+func (mc *ManagedClient) Reset() {
+	settings := ads.ClientSettings{
+		TargetNetID:          mc.cfg.TargetNetID,
+		RouterHost:           mc.cfg.RouterAddr,
+		RouterPort:           int(mc.cfg.RouterPort),
+		StatePollingInterval: mc.cfg.StatePollingInterval,
+		OnConnectionLost:     mc.onConnectionLost,
+	}
+	mc.inner = ads.NewClient(settings, mc.newSlogAdapter())
+}
+
 // Disconnect tears down the ADS connection and clears all subscriptions.
+// Safe to call when the client was never fully connected.
 func (mc *ManagedClient) Disconnect() {
-	mc.inner.Disconnect()
+	if mc.inner != nil {
+		mc.inner.Disconnect()
+	}
 }
 
 // Client returns the underlying *ads.Client for direct use.

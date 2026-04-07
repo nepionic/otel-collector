@@ -40,6 +40,8 @@ type metricsReceiver struct {
 	pushSub        *ads.ActiveSubscription
 	pushWICh       chan uint32
 
+	connected atomic.Bool // true once connect+subscribe succeeded
+
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 }
@@ -59,32 +61,91 @@ func newMetricsReceiver(set receiver.Settings, cfg *Config, next consumer.Metric
 func (r *metricsReceiver) Start(_ context.Context, _ component.Host) error {
 	r.client = adsbridge.NewManagedClient(r.cfg.toBridgeConfig(), r.logger, r.reconnect)
 
-	if err := r.client.Connect(); err != nil {
-		return fmt.Errorf("adsmetricsreceiver: ADS connect failed: %w", err)
-	}
+	r.wg.Add(1)
+	go r.connectLoop()
 
-	// Start pull subscriptions.
-	if len(r.cfg.Subscriptions) > 0 {
-		if err := r.subscribePull(); err != nil {
-			return fmt.Errorf("adsmetricsreceiver: pull subscriptions failed: %w", err)
-		}
-	}
-
-	// Start push ring buffer.
-	if r.cfg.PushRing.Enabled {
-		if err := r.initPushRing(); err != nil {
-			return fmt.Errorf("adsmetricsreceiver: push ring init failed: %w", err)
-		}
-		r.wg.Add(1)
-		go r.pushDrainLoop()
-	}
-
-	r.logger.Info("ADS metrics receiver started",
+	r.logger.Info("ADS metrics receiver starting – connecting in background",
 		zap.String("target_net_id", r.cfg.TargetNetID),
-		zap.Int("pull_subscriptions", len(r.cfg.Subscriptions)),
-		zap.Bool("push_ring_enabled", r.cfg.PushRing.Enabled),
+		zap.Duration("retry_max_interval", r.cfg.ConnectRetryMaxInterval),
 	)
 	return nil
+}
+
+// connectLoop attempts the full connect+subscribe sequence, retrying with
+// exponential backoff until it succeeds or stopCh is closed.
+func (r *metricsReceiver) connectLoop() {
+	defer r.wg.Done()
+
+	backoff := r.cfg.ConnectRetryInitialInterval
+	attempt := 0
+
+	for {
+		attempt++
+
+		if attempt > 1 {
+			r.logger.Info("Retrying ADS metrics connection",
+				zap.Int("attempt", attempt),
+				zap.Duration("backoff", backoff),
+			)
+			select {
+			case <-r.stopCh:
+				return
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+			if backoff > r.cfg.ConnectRetryMaxInterval {
+				backoff = r.cfg.ConnectRetryMaxInterval
+			}
+			r.client.Reset()
+		}
+
+		if err := r.client.Connect(); err != nil {
+			r.logger.Warn("ADS connect failed",
+				zap.Int("attempt", attempt),
+				zap.Error(err),
+			)
+			continue
+		}
+
+		if len(r.cfg.Subscriptions) > 0 {
+			if err := r.subscribePull(); err != nil {
+				r.logger.Warn("ADS pull subscriptions failed",
+					zap.Int("attempt", attempt),
+					zap.Error(err),
+				)
+				r.client.Disconnect()
+				continue
+			}
+		}
+
+		if r.cfg.PushRing.Enabled {
+			if err := r.initPushRing(); err != nil {
+				r.logger.Warn("ADS push ring init failed",
+					zap.Int("attempt", attempt),
+					zap.Error(err),
+				)
+				r.pullMu.Lock()
+				for _, s := range r.pullSubs {
+					_ = r.client.Client().Unsubscribe(s)
+				}
+				r.pullSubs = nil
+				r.pullMu.Unlock()
+				r.client.Disconnect()
+				continue
+			}
+			r.wg.Add(1)
+			go r.pushDrainLoop()
+		}
+
+		r.connected.Store(true)
+		r.logger.Info("ADS metrics receiver connected",
+			zap.String("target_net_id", r.cfg.TargetNetID),
+			zap.Int("pull_subscriptions", len(r.cfg.Subscriptions)),
+			zap.Bool("push_ring_enabled", r.cfg.PushRing.Enabled),
+			zap.Int("attempts", attempt),
+		)
+		return
+	}
 }
 
 // Shutdown implements component.Component.
@@ -92,23 +153,26 @@ func (r *metricsReceiver) Shutdown(_ context.Context) error {
 	close(r.stopCh)
 	r.wg.Wait()
 
-	// Unsubscribe pull.
-	r.pullMu.Lock()
-	for _, sub := range r.pullSubs {
-		_ = r.client.Client().Unsubscribe(sub)
-	}
-	r.pullSubs = nil
-	r.pullMu.Unlock()
+	if r.connected.Load() {
+		// Unsubscribe pull.
+		r.pullMu.Lock()
+		for _, sub := range r.pullSubs {
+			_ = r.client.Client().Unsubscribe(sub)
+		}
+		r.pullSubs = nil
+		r.pullMu.Unlock()
 
-	// Unsubscribe push.
-	r.pushRingMu.Lock()
-	if r.pushSub != nil {
-		_ = r.client.Client().Unsubscribe(r.pushSub)
-		r.pushSub = nil
-	}
-	r.pushRingMu.Unlock()
+		// Unsubscribe push.
+		r.pushRingMu.Lock()
+		if r.pushSub != nil {
+			_ = r.client.Client().Unsubscribe(r.pushSub)
+			r.pushSub = nil
+		}
+		r.pushRingMu.Unlock()
 
-	r.client.Disconnect()
+		r.client.Disconnect()
+	}
+
 	r.logger.Info("ADS metrics receiver stopped")
 	return nil
 }
