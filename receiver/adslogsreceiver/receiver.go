@@ -34,6 +34,8 @@ type logsReceiver struct {
 	subscription *ads.ActiveSubscription
 	wmu          sync.Mutex // guards subscription and ring address fields
 
+	connected atomic.Bool // true once connect+subscribe succeeded
+
 	wiCh   chan uint32 // write_index notifications feed this channel
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -54,26 +56,82 @@ func newLogsReceiver(set receiver.Settings, cfg *Config, next consumer.Logs) *lo
 func (r *logsReceiver) Start(_ context.Context, _ component.Host) error {
 	r.client = adsbridge.NewManagedClient(r.cfg.toBridgeConfig(), r.logger, r.reconnect)
 
-	if err := r.client.Connect(); err != nil {
-		return fmt.Errorf("adslogsreceiver: ADS connect failed: %w", err)
-	}
-
-	if err := r.resolveRingSymbol(); err != nil {
-		return fmt.Errorf("adslogsreceiver: ring symbol resolution failed: %w", err)
-	}
-
-	if err := r.subscribe(); err != nil {
-		return fmt.Errorf("adslogsreceiver: initial subscription failed: %w", err)
-	}
-
 	r.wg.Add(1)
-	go r.drainLoop()
+	go r.connectLoop()
 
-	r.logger.Info("ADS logs receiver started",
+	r.logger.Info("ADS logs receiver starting – connecting in background",
 		zap.String("target_net_id", r.cfg.TargetNetID),
 		zap.String("ring_symbol", r.cfg.LogRingSymbol),
+		zap.Duration("retry_max_interval", r.cfg.ConnectRetryMaxInterval),
 	)
 	return nil
+}
+
+// connectLoop attempts to connect and subscribe, retrying with exponential
+// backoff until it either succeeds or stopCh is closed.
+func (r *logsReceiver) connectLoop() {
+	defer r.wg.Done()
+
+	backoff := r.cfg.ConnectRetryInitialInterval
+	attempt := 0
+
+	for {
+		attempt++
+
+		if attempt > 1 {
+			r.logger.Info("Retrying ADS logs connection",
+				zap.Int("attempt", attempt),
+				zap.Duration("backoff", backoff),
+			)
+			select {
+			case <-r.stopCh:
+				return
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+			if backoff > r.cfg.ConnectRetryMaxInterval {
+				backoff = r.cfg.ConnectRetryMaxInterval
+			}
+			// Recreate the ads client for a clean retry.
+			r.client.Reset()
+		}
+
+		if err := r.client.Connect(); err != nil {
+			r.logger.Warn("ADS connect failed",
+				zap.Int("attempt", attempt),
+				zap.Error(err),
+			)
+			continue
+		}
+
+		if err := r.resolveRingSymbol(); err != nil {
+			r.logger.Warn("ADS ring symbol resolution failed",
+				zap.Int("attempt", attempt),
+				zap.Error(err),
+			)
+			r.client.Disconnect()
+			continue
+		}
+
+		if err := r.subscribe(); err != nil {
+			r.logger.Warn("ADS subscription failed",
+				zap.Int("attempt", attempt),
+				zap.Error(err),
+			)
+			r.client.Disconnect()
+			continue
+		}
+
+		r.connected.Store(true)
+		r.logger.Info("ADS logs receiver connected",
+			zap.String("target_net_id", r.cfg.TargetNetID),
+			zap.String("ring_symbol", r.cfg.LogRingSymbol),
+			zap.Int("attempts", attempt),
+		)
+		r.wg.Add(1)
+		go r.drainLoop()
+		return
+	}
 }
 
 // Shutdown implements component.Component.
@@ -81,13 +139,15 @@ func (r *logsReceiver) Shutdown(_ context.Context) error {
 	close(r.stopCh)
 	r.wg.Wait()
 
-	r.wmu.Lock()
-	if r.subscription != nil {
-		_ = r.client.Client().Unsubscribe(r.subscription)
+	if r.connected.Load() {
+		r.wmu.Lock()
+		if r.subscription != nil {
+			_ = r.client.Client().Unsubscribe(r.subscription)
+		}
+		r.wmu.Unlock()
+		r.client.Disconnect()
 	}
-	r.wmu.Unlock()
 
-	r.client.Disconnect()
 	r.logger.Info("ADS logs receiver stopped")
 	return nil
 }

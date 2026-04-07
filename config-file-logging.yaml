@@ -19,6 +19,8 @@ receivers:
     log_ring_symbol: "OtelBridge.LogRing"
     state_polling_interval: 2s
     subscription_cycle_time: 100ms
+    connect_retry_initial_interval: 1s  # first backoff after a failed attempt
+    connect_retry_max_interval: 30s     # backoff ceiling (doubles each attempt)
 
   # ---------------------------------------------------------------------------
   # ADS Metrics receiver – two complementary paths.
@@ -29,6 +31,8 @@ receivers:
     router_port: 48898
     plc_port: 851
     state_polling_interval: 2s
+    connect_retry_initial_interval: 1s
+    connect_retry_max_interval: 30s
 
     # Pull path – subscribe to named PLC symbols directly.
     subscriptions:

@@ -24,11 +24,13 @@ func NewFactory() receiver.Factory {
 
 func createDefaultConfig() component.Config {
 	return &Config{
-		RouterPort:            48898,
-		PLCPort:               851,
-		LogRingSymbol:         "OtelBridge.LogRing",
-		StatePollingInterval:  2 * time.Second,
-		SubscriptionCycleTime: 100 * time.Millisecond,
+		RouterPort:                  48898,
+		PLCPort:                     851,
+		LogRingSymbol:               "OtelBridge.LogRing",
+		StatePollingInterval:        2 * time.Second,
+		SubscriptionCycleTime:       100 * time.Millisecond,
+		ConnectRetryInitialInterval: 1 * time.Second,
+		ConnectRetryMaxInterval:     30 * time.Second,
 	}
 }
 
