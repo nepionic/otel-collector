@@ -64,28 +64,34 @@ func (r *metricsReceiver) Start(_ context.Context, _ component.Host) error {
 	r.wg.Add(1)
 	go r.connectLoop()
 
-	r.logger.Info("ADS metrics receiver starting – connecting in background",
+	r.logger.Info("ADS metrics receiver starting",
 		zap.String("target_net_id", r.cfg.TargetNetID),
-		zap.Duration("retry_max_interval", r.cfg.ConnectRetryMaxInterval),
+		zap.Duration("connect_retry_max", r.cfg.ConnectRetryMaxInterval),
+		zap.Duration("symbol_poll_interval", r.cfg.StatePollingInterval),
 	)
 	return nil
 }
 
-// connectLoop attempts the full connect+subscribe sequence, retrying with
-// exponential backoff until it succeeds or stopCh is closed.
+// connectLoop connects to the ADS router with exponential backoff. Once the
+// router is reached it calls subscribeLoop, which polls for PLC symbols without
+// disconnecting. Only a network-level failure restarts the backoff and resets
+// the client.
 func (r *metricsReceiver) connectLoop() {
 	defer r.wg.Done()
 
 	backoff := r.cfg.ConnectRetryInitialInterval
-	attempt := 0
 
 	for {
-		attempt++
+		select {
+		case <-r.stopCh:
+			return
+		default:
+		}
 
-		if attempt > 1 {
-			r.logger.Info("Retrying ADS metrics connection",
-				zap.Int("attempt", attempt),
-				zap.Duration("backoff", backoff),
+		if err := r.client.Connect(); err != nil {
+			r.logger.Warn("ADS connect failed",
+				zap.Duration("next_retry", backoff),
+				zap.Error(err),
 			)
 			select {
 			case <-r.stopCh:
@@ -97,55 +103,114 @@ func (r *metricsReceiver) connectLoop() {
 				backoff = r.cfg.ConnectRetryMaxInterval
 			}
 			r.client.Reset()
-		}
-
-		if err := r.client.Connect(); err != nil {
-			r.logger.Warn("ADS connect failed",
-				zap.Int("attempt", attempt),
-				zap.Error(err),
-			)
 			continue
 		}
 
-		if len(r.cfg.Subscriptions) > 0 {
-			if err := r.subscribePull(); err != nil {
-				r.logger.Warn("ADS pull subscriptions failed",
-					zap.Int("attempt", attempt),
-					zap.Error(err),
-				)
-				r.client.Disconnect()
-				continue
-			}
-		}
-
-		if r.cfg.PushRing.Enabled {
-			if err := r.initPushRing(); err != nil {
-				r.logger.Warn("ADS push ring init failed",
-					zap.Int("attempt", attempt),
-					zap.Error(err),
-				)
-				r.pullMu.Lock()
-				for _, s := range r.pullSubs {
-					_ = r.client.Client().Unsubscribe(s)
-				}
-				r.pullSubs = nil
-				r.pullMu.Unlock()
-				r.client.Disconnect()
-				continue
-			}
-			r.wg.Add(1)
-			go r.pushDrainLoop()
-		}
-
-		r.connected.Store(true)
-		r.logger.Info("ADS metrics receiver connected",
+		// Router reached – reset backoff for any future reconnect cycle.
+		backoff = r.cfg.ConnectRetryInitialInterval
+		r.logger.Info("Connected to ADS router",
 			zap.String("target_net_id", r.cfg.TargetNetID),
-			zap.Int("pull_subscriptions", len(r.cfg.Subscriptions)),
-			zap.Bool("push_ring_enabled", r.cfg.PushRing.Enabled),
-			zap.Int("attempts", attempt),
 		)
+
+		if !r.subscribeLoop() {
+			// TCP dropped while waiting for symbols; need a full reconnect.
+			r.client.Reset()
+			continue
+		}
 		return
 	}
+}
+
+// subscribeLoop polls for PLC symbols while staying connected to the router.
+// Returns true when subscribed (or stopCh fires), false when the TCP connection
+// is lost and connectLoop must re-establish it.
+func (r *metricsReceiver) subscribeLoop() bool {
+	first := true
+	for {
+		if !first {
+			select {
+			case <-r.stopCh:
+				return true
+			case <-time.After(r.cfg.StatePollingInterval):
+			}
+		}
+		first = false
+
+		select {
+		case <-r.stopCh:
+			return true
+		default:
+		}
+
+		netErr, ok := r.trySubscribeAll()
+		if netErr != nil {
+			r.logger.Warn("TCP connection dropped during setup",
+				zap.Error(netErr),
+			)
+			return false
+		}
+		if !ok {
+			r.logger.Info("PLC symbols not yet available; waiting",
+				zap.Duration("retry_in", r.cfg.StatePollingInterval),
+			)
+			continue
+		}
+		return true
+	}
+}
+
+// trySubscribeAll tries to set up all pull and push subscriptions atomically.
+// Returns (nil, true) on success, (nil, false) on an ADS-level error (retry
+// without reconnect), (err, false) on a network error (needs reconnect).
+// On any failure it cleans up any partial subscriptions from this attempt.
+func (r *metricsReceiver) trySubscribeAll() (netErr error, ok bool) {
+	// Clean up any leftover subscriptions from a previous failed attempt.
+	r.pullMu.Lock()
+	for _, s := range r.pullSubs {
+		_ = r.client.Client().Unsubscribe(s)
+	}
+	r.pullSubs = nil
+	r.pullMu.Unlock()
+
+	if len(r.cfg.Subscriptions) > 0 {
+		if err := r.subscribePull(); err != nil {
+			r.pullMu.Lock()
+			for _, s := range r.pullSubs {
+				_ = r.client.Client().Unsubscribe(s)
+			}
+			r.pullSubs = nil
+			r.pullMu.Unlock()
+			if adsbridge.IsNetworkError(err) {
+				return err, false
+			}
+			return nil, false
+		}
+	}
+
+	if r.cfg.PushRing.Enabled {
+		if err := r.initPushRing(); err != nil {
+			r.pullMu.Lock()
+			for _, s := range r.pullSubs {
+				_ = r.client.Client().Unsubscribe(s)
+			}
+			r.pullSubs = nil
+			r.pullMu.Unlock()
+			if adsbridge.IsNetworkError(err) {
+				return err, false
+			}
+			return nil, false
+		}
+		r.wg.Add(1)
+		go r.pushDrainLoop()
+	}
+
+	r.connected.Store(true)
+	r.logger.Info("ADS metrics receiver subscribed",
+		zap.String("target_net_id", r.cfg.TargetNetID),
+		zap.Int("pull_subscriptions", len(r.cfg.Subscriptions)),
+		zap.Bool("push_ring_enabled", r.cfg.PushRing.Enabled),
+	)
+	return nil, true
 }
 
 // Shutdown implements component.Component.
@@ -494,7 +559,7 @@ func (r *metricsReceiver) pushSlotsToMetrics(slots []adsbridge.MetricSlot, overf
 func (r *metricsReceiver) reconnect(client *ads.Client) error {
 	r.logger.Info("Re-establishing ADS metric subscriptions after TwinCAT restart")
 
-	// Re-subscribe pull variables.
+	// Unsubscribe and re-subscribe pull variables.
 	if len(r.cfg.Subscriptions) > 0 {
 		r.pullMu.Lock()
 		for _, sub := range r.pullSubs {
@@ -504,7 +569,7 @@ func (r *metricsReceiver) reconnect(client *ads.Client) error {
 		r.pullMu.Unlock()
 
 		if err := r.subscribePull(); err != nil {
-			r.logger.Error("Failed to re-subscribe pull metrics", zap.Error(err))
+			return fmt.Errorf("pull re-subscribe: %w", err)
 		}
 	}
 
@@ -520,9 +585,10 @@ func (r *metricsReceiver) reconnect(client *ads.Client) error {
 		atomic.StoreUint32(&r.pushLocalRI, 0)
 
 		if err := r.resolvePushRingSymbol(); err != nil {
-			r.logger.Error("Failed to re-resolve push ring symbol", zap.Error(err))
-		} else if err := r.subscribePushRing(); err != nil {
-			r.logger.Error("Failed to re-subscribe push ring", zap.Error(err))
+			return fmt.Errorf("push ring re-resolve: %w", err)
+		}
+		if err := r.subscribePushRing(); err != nil {
+			return fmt.Errorf("push ring re-subscribe: %w", err)
 		}
 	}
 
