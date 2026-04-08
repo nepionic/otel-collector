@@ -59,7 +59,7 @@ func newMetricsReceiver(set receiver.Settings, cfg *Config, next consumer.Metric
 
 // Start implements component.Component.
 func (r *metricsReceiver) Start(_ context.Context, _ component.Host) error {
-	r.client = adsbridge.NewManagedClient(r.cfg.toBridgeConfig(), r.logger, r.reconnect)
+	r.client = adsbridge.NewManagedClient(r.cfg.toBridgeConfig(), r.logger, r.reconnect, adsbridge.ManagedClientHooks{})
 
 	r.wg.Add(1)
 	go r.connectLoop()

@@ -232,8 +232,11 @@ func (r *ReadIndexStore) CompareAndSwap(old, new uint32) bool {
 //   offset   12  UDINT   attr_count        Number of populated attrs (0..10)
 //   offset   16  BYTE[192] message         STRING(191) null-terminated
 //   offset  208  BYTE[64]  source          STRING(63)  null-terminated (instance path)
-//   offset  272  OtelLogAttribute[10]      10 × 96 bytes = 960 bytes
-//                  each: key STRING(31)=32 bytes, value STRING(63)=64 bytes
+//   offset  272  LogAttribute[10]          10 × 96 bytes = 960 bytes
+//                  each attr (96 bytes):
+//                    offset  0  key         STRING(31)          = 32 bytes
+//                    offset 32  attr_type   LogAttributeType    =  1 byte
+//                    offset 33  value_bytes ARRAY[0..62] BYTE   = 63 bytes
 //   offset 1232  BYTE[44]  _pad
 //   offset 1276  UDINT   sequence          ODD=being written, EVEN=committed (LAST field)
 //   Total: 1280 bytes
@@ -241,19 +244,45 @@ func (r *ReadIndexStore) CompareAndSwap(old, new uint32) bool {
 // Ring header (64 bytes): identical layout to metric ring header.
 // Ring: header (64 bytes) + OtelLogEntry[128] (163840 bytes) = 163904 bytes total.
 
+// LogAttrType mirrors the PLC LogAttributeType enum (USINT-backed).
+type LogAttrType uint8
+
 const (
-	LogHeaderSize = 64
-	LogSlotSize   = 1280
-	LogCapacity   = 128
-	LogAttrCount  = 10
-	LogKeySize    = 32 // STRING(31) + null byte
-	LogValueSize  = 64 // STRING(63) + null byte
+	LogAttrTypeUInt8   LogAttrType = 0  // USINT: 1 byte unsigned
+	LogAttrTypeUInt16  LogAttrType = 1  // UINT:  2 bytes LE unsigned
+	LogAttrTypeUInt32  LogAttrType = 2  // UDINT: 4 bytes LE unsigned
+	LogAttrTypeUInt64  LogAttrType = 3  // ULINT: 8 bytes LE unsigned
+	LogAttrTypeInt8    LogAttrType = 4  // SINT:  1 byte signed
+	LogAttrTypeInt16   LogAttrType = 5  // INT:   2 bytes LE signed
+	LogAttrTypeInt32   LogAttrType = 6  // DINT:  4 bytes LE signed
+	LogAttrTypeInt64   LogAttrType = 7  // LINT:  8 bytes LE signed
+	LogAttrTypeBoolean LogAttrType = 8  // BOOL:  value_bytes[0]: 0=false, 1=true
+	LogAttrTypeFloat32 LogAttrType = 9  // REAL:  4 bytes LE IEEE 754
+	LogAttrTypeFloat64 LogAttrType = 10 // LREAL: 8 bytes LE IEEE 754
+	LogAttrTypeStr     LogAttrType = 11 // null-terminated STRING in value_bytes
 )
 
-// LogAttr is a single structured key/value attribute from a log entry.
+const (
+	LogHeaderSize  = 64
+	LogSlotSize    = 1280
+	LogCapacity    = 128
+	LogAttrCount   = 10
+	LogAttrSize    = 96 // key(32) + attr_type(1) + value_bytes(63)
+	LogKeySize     = 32 // STRING(31) + null
+	LogAttrTypeOff = 32 // attr_type byte offset within an attr
+	LogAttrValOff  = 33 // value_bytes start offset within an attr
+	LogAttrValLen  = 63 // value_bytes length
+)
+
+// LogAttr is a typed structured attribute from a log entry.
+// Only the field corresponding to AttrType is meaningful.
 type LogAttr struct {
-	Key   string
-	Value string
+	Key         string
+	AttrType    LogAttrType
+	StrValue    string  // AttrTypeString
+	BoolValue   bool    // AttrTypeBool
+	IntValue    int64   // AttrTypeInt/DInt/LInt/UInt/UDInt/ULInt
+	DoubleValue float64 // AttrTypeReal/LReal
 }
 
 // LogSlot is a parsed log ring buffer entry.
@@ -279,11 +308,41 @@ func ParseLogSlot(b []byte) (LogSlot, error) {
 
 	attrs := make([]LogAttr, 0, attrCount)
 	for i := uint32(0); i < attrCount; i++ {
-		base := 272 + int(i)*(LogKeySize+LogValueSize)
-		attrs = append(attrs, LogAttr{
-			Key:   nullTermString(b[base : base+LogKeySize]),
-			Value: nullTermString(b[base+LogKeySize : base+LogKeySize+LogValueSize]),
-		})
+		base := 272 + int(i)*LogAttrSize
+		key := nullTermString(b[base : base+LogKeySize])
+		raw := b[base+LogAttrValOff : base+LogAttrValOff+LogAttrValLen]
+		attrType := LogAttrType(b[base+LogAttrTypeOff])
+
+		attr := LogAttr{Key: key, AttrType: attrType}
+		switch attrType {
+		case LogAttrTypeStr:
+			attr.StrValue = nullTermString(raw)
+		case LogAttrTypeBoolean:
+			attr.BoolValue = raw[0] != 0
+		case LogAttrTypeInt8:
+			attr.IntValue = int64(int8(raw[0]))
+		case LogAttrTypeInt16:
+			attr.IntValue = int64(int16(binary.LittleEndian.Uint16(raw)))
+		case LogAttrTypeInt32:
+			attr.IntValue = int64(int32(binary.LittleEndian.Uint32(raw)))
+		case LogAttrTypeInt64:
+			attr.IntValue = int64(binary.LittleEndian.Uint64(raw))
+		case LogAttrTypeUInt8:
+			attr.IntValue = int64(raw[0])
+		case LogAttrTypeUInt16:
+			attr.IntValue = int64(binary.LittleEndian.Uint16(raw))
+		case LogAttrTypeUInt32:
+			attr.IntValue = int64(binary.LittleEndian.Uint32(raw))
+		case LogAttrTypeUInt64:
+			attr.IntValue = int64(binary.LittleEndian.Uint64(raw)) // may wrap for values > MaxInt64
+		case LogAttrTypeFloat32:
+			attr.DoubleValue = float64(math.Float32frombits(binary.LittleEndian.Uint32(raw)))
+		case LogAttrTypeFloat64:
+			attr.DoubleValue = math.Float64frombits(binary.LittleEndian.Uint64(raw))
+		default:
+			attr.StrValue = nullTermString(raw)
+		}
+		attrs = append(attrs, attr)
 	}
 
 	return LogSlot{
