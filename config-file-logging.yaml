@@ -12,7 +12,7 @@ receivers:
   # ADS Logs receiver – reads from the TwinCAT OtelBridge log ring buffer.
   # ---------------------------------------------------------------------------
   adsevents:
-    target_net_id: "192.168.1.1.1.1"   # AMS Net ID of the TwinCAT system
+    target_net_id: "199.4.42.250.1.1"   # AMS Net ID of the TwinCAT system
     # router_addr: "192.168.1.1"        # Set for direct TCP (no local TwinCAT router)
     router_port: 48898
     plc_port: 851
@@ -26,7 +26,7 @@ receivers:
   # ADS Metrics receiver – two complementary paths.
   # ---------------------------------------------------------------------------
   adsmetrics:
-    target_net_id: "192.168.1.1.1.1"
+    target_net_id: "199.4.42.250.1.1"
     # router_addr: "192.168.1.1"
     router_port: 48898
     plc_port: 851

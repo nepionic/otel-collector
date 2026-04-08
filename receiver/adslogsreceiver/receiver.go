@@ -30,7 +30,6 @@ type logsReceiver struct {
 	ringGroup    uint32 // ADS IndexGroup of the log ring symbol
 	ringOffset   uint32 // ADS IndexOffset of the log ring symbol
 	ringSize     uint32 // total byte size of the log ring symbol
-	subOnce      sync.Once
 	subscription *ads.ActiveSubscription
 	wmu          sync.Mutex // guards subscription and ring address fields
 
@@ -59,29 +58,35 @@ func (r *logsReceiver) Start(_ context.Context, _ component.Host) error {
 	r.wg.Add(1)
 	go r.connectLoop()
 
-	r.logger.Info("ADS logs receiver starting – connecting in background",
+	r.logger.Info("ADS logs receiver starting",
 		zap.String("target_net_id", r.cfg.TargetNetID),
 		zap.String("ring_symbol", r.cfg.LogRingSymbol),
-		zap.Duration("retry_max_interval", r.cfg.ConnectRetryMaxInterval),
+		zap.Duration("connect_retry_max", r.cfg.ConnectRetryMaxInterval),
+		zap.Duration("symbol_poll_interval", r.cfg.StatePollingInterval),
 	)
 	return nil
 }
 
-// connectLoop attempts to connect and subscribe, retrying with exponential
-// backoff until it either succeeds or stopCh is closed.
+// connectLoop connects to the ADS router with exponential backoff. Once the
+// router is reached it calls subscribeLoop, which polls for PLC symbols without
+// disconnecting. Only a network-level failure restarts the backoff and resets
+// the client.
 func (r *logsReceiver) connectLoop() {
 	defer r.wg.Done()
 
 	backoff := r.cfg.ConnectRetryInitialInterval
-	attempt := 0
 
 	for {
-		attempt++
+		select {
+		case <-r.stopCh:
+			return
+		default:
+		}
 
-		if attempt > 1 {
-			r.logger.Info("Retrying ADS logs connection",
-				zap.Int("attempt", attempt),
-				zap.Duration("backoff", backoff),
+		if err := r.client.Connect(); err != nil {
+			r.logger.Warn("ADS connect failed",
+				zap.Duration("next_retry", backoff),
+				zap.Error(err),
 			)
 			select {
 			case <-r.stopCh:
@@ -92,45 +97,80 @@ func (r *logsReceiver) connectLoop() {
 			if backoff > r.cfg.ConnectRetryMaxInterval {
 				backoff = r.cfg.ConnectRetryMaxInterval
 			}
-			// Recreate the ads client for a clean retry.
 			r.client.Reset()
-		}
-
-		if err := r.client.Connect(); err != nil {
-			r.logger.Warn("ADS connect failed",
-				zap.Int("attempt", attempt),
-				zap.Error(err),
-			)
 			continue
 		}
 
+		// Router reached – reset backoff for any future reconnect cycle.
+		backoff = r.cfg.ConnectRetryInitialInterval
+		r.logger.Info("Connected to ADS router",
+			zap.String("target_net_id", r.cfg.TargetNetID),
+		)
+
+		if !r.subscribeLoop() {
+			// TCP dropped while waiting for symbols; need a full reconnect.
+			r.client.Reset()
+			continue
+		}
+		return
+	}
+}
+
+// subscribeLoop polls for the log ring symbol while staying connected to the
+// router. ADS errors (e.g. "Symbol not found") cause a wait-and-retry without
+// disconnecting. Returns true when subscribed (or stopCh fires), false when
+// the TCP connection is lost and connectLoop must re-establish it.
+func (r *logsReceiver) subscribeLoop() bool {
+	first := true
+	for {
+		if !first {
+			select {
+			case <-r.stopCh:
+				return true
+			case <-time.After(r.cfg.StatePollingInterval):
+			}
+		}
+		first = false
+
+		select {
+		case <-r.stopCh:
+			return true
+		default:
+		}
+
 		if err := r.resolveRingSymbol(); err != nil {
-			r.logger.Warn("ADS ring symbol resolution failed",
-				zap.Int("attempt", attempt),
-				zap.Error(err),
+			if adsbridge.IsNetworkError(err) {
+				r.logger.Warn("TCP connection dropped during symbol lookup",
+					zap.Error(err),
+				)
+				return false
+			}
+			r.logger.Info("Log ring symbol not yet available; waiting",
+				zap.String("symbol", r.cfg.LogRingSymbol),
+				zap.Duration("retry_in", r.cfg.StatePollingInterval),
 			)
-			r.client.Disconnect()
 			continue
 		}
 
 		if err := r.subscribe(); err != nil {
-			r.logger.Warn("ADS subscription failed",
-				zap.Int("attempt", attempt),
-				zap.Error(err),
-			)
-			r.client.Disconnect()
+			if adsbridge.IsNetworkError(err) {
+				r.logger.Warn("TCP connection dropped during subscribe",
+					zap.Error(err),
+				)
+				return false
+			}
+			r.logger.Warn("Subscribe failed; retrying", zap.Error(err))
 			continue
 		}
 
 		r.connected.Store(true)
-		r.logger.Info("ADS logs receiver connected",
+		r.logger.Info("ADS logs receiver subscribed",
 			zap.String("target_net_id", r.cfg.TargetNetID),
 			zap.String("ring_symbol", r.cfg.LogRingSymbol),
-			zap.Int("attempts", attempt),
 		)
 		r.wg.Add(1)
 		go r.drainLoop()
-		return
+		return true
 	}
 }
 

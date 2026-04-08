@@ -4,7 +4,10 @@ package adsbridge
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -51,6 +54,9 @@ type ManagedClient struct {
 	inner       *ads.Client
 	reconnectFn ReconnectFunc
 	mu          sync.RWMutex
+	// lostDone is closed by Reset() so orphaned onConnectionLost goroutines
+	// started for a now-replaced client exit promptly instead of leaking.
+	lostDone chan struct{}
 }
 
 // NewManagedClient creates a ManagedClient. The optional reconnectFn is invoked
@@ -60,6 +66,7 @@ func NewManagedClient(cfg Config, logger *zap.Logger, reconnectFn ReconnectFunc)
 		cfg:         cfg,
 		zapLogger:   logger,
 		reconnectFn: reconnectFn,
+		lostDone:    make(chan struct{}),
 	}
 
 	settings := ads.ClientSettings{
@@ -83,6 +90,11 @@ func (mc *ManagedClient) Connect() error {
 // after a failed or partially-failed Connect. Must only be called when the
 // previous client is no longer connected.
 func (mc *ManagedClient) Reset() {
+	// Signal any orphaned onConnectionLost goroutines from the old client to
+	// exit instead of polling a dead connection forever.
+	close(mc.lostDone)
+	mc.lostDone = make(chan struct{})
+
 	settings := ads.ClientSettings{
 		TargetNetID:          mc.cfg.TargetNetID,
 		RouterHost:           mc.cfg.RouterAddr,
@@ -106,35 +118,74 @@ func (mc *ManagedClient) Client() *ads.Client {
 	return mc.inner
 }
 
+// IsNetworkError reports whether err is a TCP/network-level failure as opposed
+// to an ADS protocol error (e.g. "Symbol not found"). When true the caller
+// should tear down and re-establish the ADS connection. When false the TCP
+// connection is still alive and only the PLC-side resource is missing.
+func IsNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	s := err.Error()
+	return strings.Contains(s, "EOF") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "forcibly closed") ||
+		strings.Contains(s, "use of closed network connection")
+}
+
 // onConnectionLost is registered as the ads.ClientSettings.OnConnectionLost
-// callback. It blocks (in a goroutine spawned by ads-go) until TwinCAT returns
-// to Run state, then calls the user-registered reconnectFn.
+// callback. It runs in a goroutine spawned by ads-go, polling until TwinCAT
+// returns to Run state and then calling reconnectFn in a retry loop until it
+// succeeds (handles the case where symbols aren't deployed yet on restart).
 func (mc *ManagedClient) onConnectionLost(client *ads.Client, err error) {
 	mc.zapLogger.Warn("ADS connection lost – waiting for TwinCAT Run state",
 		zap.Error(err),
 		zap.String("target_net_id", mc.cfg.TargetNetID),
 	)
 
+	// Capture done so that if Reset() replaces this client, we exit cleanly
+	// instead of leaking this goroutine.
+	done := mc.lostDone
+
 	tick := time.NewTicker(mc.cfg.StatePollingInterval)
 	defer tick.Stop()
 
-	for range tick.C {
-		state := client.GetCurrentState()
-		if state == nil {
-			continue
-		}
-		// AdsState 5 == Run.
-		if state.AdsState == 5 {
-			mc.zapLogger.Info("TwinCAT returned to Run state – reconnecting",
+	for {
+		select {
+		case <-done:
+			mc.zapLogger.Debug("onConnectionLost: client replaced, exiting",
 				zap.String("target_net_id", mc.cfg.TargetNetID),
 			)
-			if mc.reconnectFn != nil {
-				if rErr := mc.reconnectFn(client); rErr != nil {
-					mc.zapLogger.Error("reconnect callback failed", zap.Error(rErr))
-				}
-			}
+			return
+		case <-tick.C:
+		}
+
+		state := client.GetCurrentState()
+		if state == nil || state.AdsState != 5 {
+			continue
+		}
+
+		// TwinCAT is in Run state. Attempt reconnect.
+		if mc.reconnectFn == nil {
 			return
 		}
+		if rErr := mc.reconnectFn(client); rErr != nil {
+			// Symbols may not be deployed yet – keep polling until they appear.
+			mc.zapLogger.Info("Reconnect attempt failed, will retry on next poll",
+				zap.Error(rErr),
+				zap.String("target_net_id", mc.cfg.TargetNetID),
+			)
+			continue
+		}
+		mc.zapLogger.Info("Reconnected successfully after TwinCAT restart",
+			zap.String("target_net_id", mc.cfg.TargetNetID),
+		)
+		return
 	}
 }
 
