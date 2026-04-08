@@ -15,23 +15,33 @@ receivers:
   # ---------------------------------------------------------------------------
   adsevents:
     target_net_id: "192.168.1.1.1.1"   # AMS Net ID of the TwinCAT system
+    plc_port: 851
     # router_addr: "192.168.1.1"        # Set for direct TCP (no local TwinCAT router)
     router_port: 48898
-    plc_port: 851
-    log_ring_symbol: "OtelBridge.LogRing"
     state_polling_interval: 2s
     subscription_cycle_time: 100ms
     connect_retry_initial_interval: 1s  # first backoff after a failed attempt
     connect_retry_max_interval: 30s     # backoff ceiling (doubles each attempt)
+
+    # System logs – collector-generated events the PLC cannot supply itself:
+    #   - TwinCAT ADS state changes  (Run ↔ Stop, Config, Error, …)
+    #   - TCP connection established / lost / reconnected after restart
+    #   - Log ring buffer overflows  (PLC writing faster than collector drains)
+    # All sub-options default to true; set enabled: false to silence all of them.
+    system_logs:
+      enabled: true
+      plc_state_changes: true   # Run→Stop, Config→Run, initial state, …
+      connection_events: true   # connected, connection lost, reconnected
+      ring_overflows: true      # warn when PLC ring laps the collector
 
   # ---------------------------------------------------------------------------
   # ADS Metrics receiver – two complementary paths.
   # ---------------------------------------------------------------------------
   adsmetrics:
     target_net_id: "192.168.1.1.1.1"
+    plc_port: 851
     # router_addr: "192.168.1.1"
     router_port: 48898
-    plc_port: 851
     state_polling_interval: 2s
     connect_retry_initial_interval: 1s
     connect_retry_max_interval: 30s
@@ -80,6 +90,23 @@ processors:
     send_batch_size: 1000
     timeout: 1s
 
+  # Stamp every log/metric with site-specific metadata the PLC cannot supply.
+  # Values can be literals or ${env:VAR_NAME} references (resolved at startup).
+  resource:
+    attributes:
+      - key: site.id
+        value: "${env:SITE_ID}"
+        action: upsert
+      - key: deployment.region
+        value: "${env:SITE_REGION}"
+        action: upsert
+      # - key: site.name
+      #   value: "Acme Plant 3"
+      #   action: upsert
+      # - key: machine.id
+      #   value: "${env:MACHINE_ID}"
+      #   action: upsert
+
 exporters:
   # Send everything to an OTLP-compatible backend (Grafana, Jaeger, etc.)
   otlp:
@@ -97,10 +124,10 @@ service:
   pipelines:
     logs:
       receivers: [adsevents]
-      processors: [memory_limiter, batch]
+      processors: [memory_limiter, resource, batch]
       exporters: [otlp, debug]
 
     metrics:
       receivers: [adsmetrics]
-      processors: [memory_limiter, batch]
+      processors: [memory_limiter, resource, batch]
       exporters: [otlp, debug]

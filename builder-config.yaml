@@ -14,6 +14,7 @@ dist:
 
 extensions:
   - gomod: go.opentelemetry.io/collector/extension/zpagesextension v0.149.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/basicauthextension v0.149.0
 
 receivers:
   - gomod: github.com/nepionic/otelcol-ads v0.1.0
@@ -28,9 +29,11 @@ receivers:
 
 exporters:
   - gomod: go.opentelemetry.io/collector/exporter/otlpexporter v0.149.0
+  - gomod: go.opentelemetry.io/collector/exporter/otlphttpexporter v0.149.0
   - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.149.0
   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/fileexporter v0.149.0
 
 processors:
   - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.149.0
   - gomod: go.opentelemetry.io/collector/processor/memorylimiterprocessor v0.149.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourceprocessor v0.149.0

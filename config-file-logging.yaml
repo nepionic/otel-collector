@@ -7,16 +7,20 @@ extensions:
   zpages:
     endpoint: 0.0.0.0:55679
 
+  basicauth/grafana_cloud:
+    client_auth:
+      username: "${GRAFANA_CLOUD_INSTANCE_ID}"
+      password: "${GRAFANA_CLOUD_API_TOKEN}"
+
 receivers:
   # ---------------------------------------------------------------------------
   # ADS Logs receiver – reads from the TwinCAT OtelBridge log ring buffer.
   # ---------------------------------------------------------------------------
   adsevents:
     target_net_id: "199.4.42.250.1.1"   # AMS Net ID of the TwinCAT system
+    plc_port: 851
     # router_addr: "192.168.1.1"        # Set for direct TCP (no local TwinCAT router)
     router_port: 48898
-    plc_port: 851
-    log_ring_symbol: "OtelBridge.LogRing"
     state_polling_interval: 2s
     subscription_cycle_time: 100ms
     connect_retry_initial_interval: 1s  # first backoff after a failed attempt
@@ -25,46 +29,46 @@ receivers:
   # ---------------------------------------------------------------------------
   # ADS Metrics receiver – two complementary paths.
   # ---------------------------------------------------------------------------
-  adsmetrics:
-    target_net_id: "199.4.42.250.1.1"
-    # router_addr: "192.168.1.1"
-    router_port: 48898
-    plc_port: 851
-    state_polling_interval: 2s
-    connect_retry_initial_interval: 1s
-    connect_retry_max_interval: 30s
+  # adsmetrics:
+  #   target_net_id: "199.4.42.250.1.1"
+  #   # router_addr: "192.168.1.1"
+  #   router_port: 48898
+  #   plc_port: 851
+  #   state_polling_interval: 2s
+  #   connect_retry_initial_interval: 1s
+  #   connect_retry_max_interval: 30s
 
     # Pull path – subscribe to named PLC symbols directly.
-    subscriptions:
-      - symbol: "MAIN.temperature"
-        name: "plc.reactor.temperature"
-        unit: "Cel"
-        description: "Reactor temperature sensor"
-        type: gauge
-        cycle_time: 500ms
-        send_on_change: true
+    # subscriptions:
+    #   - symbol: "MAIN.temperature"
+    #     name: "plc.reactor.temperature"
+    #     unit: "Cel"
+    #     description: "Reactor temperature sensor"
+    #     type: gauge
+    #     cycle_time: 500ms
+    #     send_on_change: true
 
-      - symbol: "MAIN.production_count"
-        name: "plc.production.items_total"
-        unit: "{items}"
-        description: "Total items produced since PLC start"
-        type: counter
-        cycle_time: 1s
-        send_on_change: true
+    #   - symbol: "MAIN.production_count"
+    #     name: "plc.production.items_total"
+    #     unit: "{items}"
+    #     description: "Total items produced since PLC start"
+    #     type: counter
+    #     cycle_time: 1s
+    #     send_on_change: true
 
-      - symbol: "MAIN.conveyor_speed"
-        name: "plc.conveyor.speed"
-        unit: "mm/s"
-        description: "Conveyor belt speed"
-        type: gauge
-        cycle_time: 200ms
-        send_on_change: true
+    #   - symbol: "MAIN.conveyor_speed"
+    #     name: "plc.conveyor.speed"
+    #     unit: "mm/s"
+    #     description: "Conveyor belt speed"
+    #     type: gauge
+    #     cycle_time: 200ms
+    #     send_on_change: true
 
     # Push path – reads from the TwinCAT OtelBridge lock-free metric ring.
-    push_ring:
-      enabled: false
-      symbol: "OtelBridge.MetricRing"
-      subscription_cycle_time: 100ms
+    # push_ring:
+    #   enabled: false
+    #   symbol: "OtelBridge.MetricRing"
+    #   subscription_cycle_time: 100ms
 
 processors:
   memory_limiter:
@@ -75,6 +79,23 @@ processors:
   batch:
     send_batch_size: 1000
     timeout: 1s
+
+  # Stamp every log/metric with site-specific metadata the PLC cannot supply.
+  # Values can be literals or ${env:VAR_NAME} references (resolved at startup).
+  resource:
+    attributes:
+      - key: site.id
+        value: "${env:SITE_ID}"
+        action: upsert
+      - key: machine.ids
+        value: "${env:MACHINE_ID}"
+        action: upsert
+      # - key: site.name
+      #   value: "Acme Plant 3"
+      #   action: upsert
+      # - key: machine.id
+      #   value: "${env:MACHINE_ID}"
+      #   action: upsert
 
 exporters:
   # Write logs to a local file in OTLP JSON format.
@@ -99,16 +120,24 @@ exporters:
   debug:
     verbosity: detailed
 
+  # Send everything to an OTLP-compatible backend (Grafana, Jaeger, etc.)
+  otlphttp/grafana_cloud:
+    endpoint: "${GRAFANA_CLOUD_ENDPOINT}"
+    auth:
+      authenticator: basicauth/grafana_cloud
+    tls:
+      insecure: false
+
 service:
-  extensions: [zpages]
+  extensions: [basicauth/grafana_cloud, zpages]
 
   pipelines:
     logs:
       receivers: [adsevents]
-      processors: [memory_limiter, batch]
-      exporters: [file/logs, debug]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlphttp/grafana_cloud, file/logs, debug]
 
-    metrics:
-      receivers: [adsmetrics]
-      processors: [memory_limiter, batch]
-      exporters: [file/metrics, debug]
+    # metrics:
+    #   receivers: [adsmetrics]
+    #   processors: [memory_limiter, resource, batch]
+    #   exporters: [file/metrics, debug]
