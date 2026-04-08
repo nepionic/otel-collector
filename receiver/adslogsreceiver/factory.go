@@ -26,11 +26,17 @@ func createDefaultConfig() component.Config {
 	return &Config{
 		RouterPort:                  48898,
 		PLCPort:                     851,
-		LogRingSymbol:               "OtelBridge.LogRing",
+		LogRingSymbol:               "", // auto-discovered via {attribute 'otelcol_role' := 'log_ring'}
 		StatePollingInterval:        2 * time.Second,
 		SubscriptionCycleTime:       100 * time.Millisecond,
 		ConnectRetryInitialInterval: 1 * time.Second,
 		ConnectRetryMaxInterval:     30 * time.Second,
+		SystemLogs: SystemLogsConfig{
+			Enabled:          true,
+			PLCStateChanges:  true,
+			ConnectionEvents: true,
+			RingOverflows:    true,
+		},
 	}
 }
 

@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/jarmocluyse/ads-go/pkg/ads"
+	adsstateinfo "github.com/jarmocluyse/ads-go/pkg/ads/ads-stateinfo"
+	adstypes "github.com/jarmocluyse/ads-go/pkg/ads/types"
 	"github.com/nepionic/otelcol-ads/internal/adsbridge"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
@@ -53,7 +55,20 @@ func newLogsReceiver(set receiver.Settings, cfg *Config, next consumer.Logs) *lo
 
 // Start implements component.Component.
 func (r *logsReceiver) Start(_ context.Context, _ component.Host) error {
-	r.client = adsbridge.NewManagedClient(r.cfg.toBridgeConfig(), r.logger, r.reconnect)
+	hooks := adsbridge.ManagedClientHooks{
+		OnStateChange: r.onStateChange,
+		OnConnectionLost: func(err error) {
+			if r.cfg.SystemLogs.Enabled && r.cfg.SystemLogs.ConnectionEvents {
+				r.emitSystemLog(
+					plog.SeverityNumberWarn, "WARN",
+					"ads.connection.lost",
+					fmt.Sprintf("ADS connection lost: %v", err),
+					nil,
+				)
+			}
+		},
+	}
+	r.client = adsbridge.NewManagedClient(r.cfg.toBridgeConfig(), r.logger, r.reconnect, hooks)
 
 	r.wg.Add(1)
 	go r.connectLoop()
@@ -107,6 +122,19 @@ func (r *logsReceiver) connectLoop() {
 			zap.String("target_net_id", r.cfg.TargetNetID),
 		)
 
+		if r.cfg.SystemLogs.Enabled && r.cfg.SystemLogs.ConnectionEvents {
+			r.emitSystemLog(
+				plog.SeverityNumberInfo, "INFO",
+				"ads.connection.established",
+				"Connected to ADS router",
+				func(m pcommon.Map) {
+					if r.cfg.RouterAddr != "" {
+						m.PutStr("ads.router_addr", r.cfg.RouterAddr)
+					}
+				},
+			)
+		}
+
 		if !r.subscribeLoop() {
 			// TCP dropped while waiting for symbols; need a full reconnect.
 			r.client.Reset()
@@ -136,6 +164,25 @@ func (r *logsReceiver) subscribeLoop() bool {
 		case <-r.stopCh:
 			return true
 		default:
+		}
+
+		// If no ring symbol is configured, discover it by scanning the PLC
+		// symbol table for a variable with {attribute 'otelcol_role' := 'log_ring'}.
+		if r.cfg.LogRingSymbol == "" {
+			sym, err := adsbridge.FindLogRingSymbol(r.client.Client(), r.cfg.PLCPort)
+			if err != nil {
+				if adsbridge.IsNetworkError(err) {
+					r.logger.Warn("TCP connection dropped during symbol discovery", zap.Error(err))
+					return false
+				}
+				r.logger.Info("Log ring symbol not yet discovered; waiting",
+					zap.Error(err),
+					zap.Duration("retry_in", r.cfg.StatePollingInterval),
+				)
+				continue
+			}
+			r.logger.Info("Discovered log ring symbol", zap.String("symbol", sym))
+			r.cfg.LogRingSymbol = sym
 		}
 
 		if err := r.resolveRingSymbol(); err != nil {
@@ -207,11 +254,11 @@ func (r *logsReceiver) resolveRingSymbol() error {
 	return nil
 }
 
-// subscribe registers an ADS on-change notification on the write_index field.
-// The write_index is the first UDINT in the header, so its symbol path is
-// "<LogRingSymbol>.header.write_index".
+// subscribe registers an ADS on-change notification on the head field.
+// head is the first UDINT in OTelLogRing, so its symbol path is
+// "<LogRingSymbol>.head".
 func (r *logsReceiver) subscribe() error {
-	wiPath := r.cfg.LogRingSymbol + ".header.write_index"
+	wiPath := r.cfg.LogRingSymbol + ".head"
 
 	cb := func(data ads.SubscriptionData) {
 		wi, ok := data.Value.(uint32)
@@ -265,7 +312,19 @@ func (r *logsReceiver) reconnect(client *ads.Client) error {
 	// Reset read cursor so we don't try to replay stale slots.
 	atomic.StoreUint32(&r.localRI, 0)
 
-	return r.subscribe()
+	if err := r.subscribe(); err != nil {
+		return err
+	}
+
+	if r.cfg.SystemLogs.Enabled && r.cfg.SystemLogs.ConnectionEvents {
+		r.emitSystemLog(
+			plog.SeverityNumberInfo, "INFO",
+			"ads.plc.reconnected",
+			"Reconnected to TwinCAT after restart",
+			nil,
+		)
+	}
+	return nil
 }
 
 // drainLoop blocks on write_index notifications and drains new log slots.
@@ -287,6 +346,23 @@ func (r *logsReceiver) drain(newWI uint32) {
 	lri := atomic.LoadUint32(&r.localRI)
 	if newWI == lri {
 		return
+	}
+
+	// Detect ring overflow before reading: if the PLC has written more than a
+	// full ring's worth of entries since our last drain, some will be lost.
+	if r.cfg.SystemLogs.Enabled && r.cfg.SystemLogs.RingOverflows {
+		if pending := newWI - lri; pending > adsbridge.LogCapacity {
+			lost := pending - adsbridge.LogCapacity/2
+			r.emitSystemLog(
+				plog.SeverityNumberWarn, "WARN",
+				"ads.ring.overflow",
+				fmt.Sprintf("Log ring buffer overflowed: ~%d entries lost", lost),
+				func(m pcommon.Map) {
+					m.PutInt("ads.ring.lost_count", int64(lost))
+					m.PutInt("ads.ring.capacity", int64(adsbridge.LogCapacity))
+				},
+			)
+		}
 	}
 
 	r.wmu.Lock()
@@ -345,8 +421,21 @@ func (r *logsReceiver) slotsToLogs(slots []adsbridge.LogSlot) plog.Logs {
 			la.PutStr("ads.source", s.Source)
 		}
 		for _, a := range s.Attrs {
-			if a.Key != "" {
-				la.PutStr(a.Key, a.Value)
+			if a.Key == "" {
+				continue
+			}
+			switch a.AttrType {
+			case adsbridge.LogAttrTypeStr:
+				la.PutStr(a.Key, a.StrValue)
+			case adsbridge.LogAttrTypeBoolean:
+				la.PutBool(a.Key, a.BoolValue)
+			case adsbridge.LogAttrTypeInt8, adsbridge.LogAttrTypeInt16, adsbridge.LogAttrTypeInt32, adsbridge.LogAttrTypeInt64,
+				adsbridge.LogAttrTypeUInt8, adsbridge.LogAttrTypeUInt16, adsbridge.LogAttrTypeUInt32, adsbridge.LogAttrTypeUInt64:
+				la.PutInt(a.Key, a.IntValue)
+			case adsbridge.LogAttrTypeFloat32, adsbridge.LogAttrTypeFloat64:
+				la.PutDouble(a.Key, a.DoubleValue)
+			default:
+				la.PutStr(a.Key, a.StrValue)
 			}
 		}
 	}
@@ -386,5 +475,91 @@ func adsSeverityText(severity uint32) string {
 		return "FATAL"
 	default:
 		return ""
+	}
+}
+
+// ---------------------------------------------------------------------------
+// System log helpers – collector-generated events
+// ---------------------------------------------------------------------------
+
+// emitSystemLog creates and forwards a single collector-generated log record.
+// setAttrs is an optional callback to add extra attributes; pass nil if none.
+// It is safe to call concurrently from goroutines.
+func (r *logsReceiver) emitSystemLog(
+	severity plog.SeverityNumber,
+	severityText, eventName, body string,
+	setAttrs func(pcommon.Map),
+) {
+	logs := plog.NewLogs()
+	rl := logs.ResourceLogs().AppendEmpty()
+	ra := rl.Resource().Attributes()
+	ra.PutStr("service.name", r.settings.ID.Name())
+	ra.PutStr("ads.net_id", r.cfg.TargetNetID)
+
+	sl := rl.ScopeLogs().AppendEmpty()
+	sl.Scope().SetName("otelcol-ads/adslogsreceiver")
+
+	now := pcommon.NewTimestampFromTime(time.Now())
+	lr := sl.LogRecords().AppendEmpty()
+	lr.SetTimestamp(now)
+	lr.SetObservedTimestamp(now)
+	lr.SetSeverityNumber(severity)
+	lr.SetSeverityText(severityText)
+	lr.Body().SetStr(body)
+	lr.Attributes().PutStr("event.name", eventName)
+	lr.Attributes().PutStr("ads.event.source", "otelcol")
+	if setAttrs != nil {
+		setAttrs(lr.Attributes())
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := r.nextConsumer.ConsumeLogs(ctx, logs); err != nil {
+		r.logger.Warn("Failed to emit system log",
+			zap.String("event", eventName),
+			zap.Error(err),
+		)
+	}
+}
+
+// onStateChange is registered as the ManagedClientHooks.OnStateChange callback.
+// It fires on every TwinCAT ADS state transition and on the first state read.
+func (r *logsReceiver) onStateChange(newState, oldState *adsstateinfo.SystemState) {
+	if !r.cfg.SystemLogs.Enabled || !r.cfg.SystemLogs.PLCStateChanges {
+		return
+	}
+
+	sev, sevText := plcStateChangeSeverity(newState.AdsState)
+	var body string
+	if oldState == nil {
+		body = fmt.Sprintf("TwinCAT initial state: %s", newState.AdsState)
+	} else {
+		body = fmt.Sprintf("TwinCAT state changed: %s \u2192 %s", oldState.AdsState, newState.AdsState)
+	}
+
+	r.emitSystemLog(sev, sevText, "ads.plc.state_change", body, func(m pcommon.Map) {
+		m.PutStr("ads.state.name", newState.AdsState.String())
+		m.PutInt("ads.state.id", int64(newState.AdsState))
+		if oldState != nil {
+			m.PutStr("ads.state.previous", oldState.AdsState.String())
+			m.PutInt("ads.state.previous_id", int64(oldState.AdsState))
+		}
+	})
+}
+
+// plcStateChangeSeverity maps a TwinCAT ADS state to an OTel severity level.
+func plcStateChangeSeverity(state adstypes.ADSState) (plog.SeverityNumber, string) {
+	switch state {
+	case adstypes.ADSStateRun, adstypes.ADSStatePowerGood, adstypes.ADSStateResume:
+		return plog.SeverityNumberInfo, "INFO"
+	case adstypes.ADSStateStop, adstypes.ADSStateStopping,
+		adstypes.ADSStateShutdown, adstypes.ADSStateSuspend:
+		return plog.SeverityNumberWarn, "WARN"
+	case adstypes.ADSStateError, adstypes.ADSStateException,
+		adstypes.ADSStatePowerFailure, adstypes.ADSStateIncompatible,
+		adstypes.ADSStateInvalid:
+		return plog.SeverityNumberError, "ERROR"
+	default:
+		return plog.SeverityNumberInfo, "INFO"
 	}
 }

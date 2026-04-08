@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jarmocluyse/ads-go/pkg/ads"
+	adsstateinfo "github.com/jarmocluyse/ads-go/pkg/ads/ads-stateinfo"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -46,6 +47,20 @@ func DefaultConfig() Config {
 // re-resolve symbol handles and re-register subscriptions.
 type ReconnectFunc func(client *ads.Client) error
 
+// ManagedClientHooks holds optional lifecycle notification callbacks wired into
+// the underlying ads.Client. All fields are optional; nil functions are ignored.
+type ManagedClientHooks struct {
+	// OnStateChange is invoked (from a background goroutine) whenever the
+	// TwinCAT ADS state transitions. oldState is nil on the first successful
+	// state read after connect.
+	OnStateChange func(newState, oldState *adsstateinfo.SystemState)
+
+	// OnConnectionLost is invoked when the ADS connection drops (TCP failure or
+	// consecutive state-poll failure). It fires before the internal
+	// reconnect-polling loop begins, giving callers a chance to emit an event.
+	OnConnectionLost func(err error)
+}
+
 // ManagedClient wraps an ads.Client with automatic reconnect support and
 // bridges ads-go's log/slog interface to OTel's *zap.Logger.
 type ManagedClient struct {
@@ -53,6 +68,7 @@ type ManagedClient struct {
 	zapLogger   *zap.Logger
 	inner       *ads.Client
 	reconnectFn ReconnectFunc
+	hooks       ManagedClientHooks
 	mu          sync.RWMutex
 	// lostDone is closed by Reset() so orphaned onConnectionLost goroutines
 	// started for a now-replaced client exit promptly instead of leaking.
@@ -60,25 +76,36 @@ type ManagedClient struct {
 }
 
 // NewManagedClient creates a ManagedClient. The optional reconnectFn is invoked
-// each time the TwinCAT runtime returns to Run state.
-func NewManagedClient(cfg Config, logger *zap.Logger, reconnectFn ReconnectFunc) *ManagedClient {
+// each time the TwinCAT runtime returns to Run state. The hooks parameter allows
+// callers to receive state-change and connection-lost notifications.
+func NewManagedClient(cfg Config, logger *zap.Logger, reconnectFn ReconnectFunc, hooks ManagedClientHooks) *ManagedClient {
 	mc := &ManagedClient{
 		cfg:         cfg,
 		zapLogger:   logger,
 		reconnectFn: reconnectFn,
+		hooks:       hooks,
 		lostDone:    make(chan struct{}),
 	}
+	mc.inner = ads.NewClient(mc.buildSettings(), mc.newSlogAdapter())
+	return mc
+}
 
+// buildSettings constructs the ads.ClientSettings, wiring in lifecycle hooks.
+func (mc *ManagedClient) buildSettings() ads.ClientSettings {
 	settings := ads.ClientSettings{
-		TargetNetID:          cfg.TargetNetID,
-		RouterHost:           cfg.RouterAddr,
-		RouterPort:           int(cfg.RouterPort),
-		StatePollingInterval: cfg.StatePollingInterval,
+		TargetNetID:          mc.cfg.TargetNetID,
+		RouterHost:           mc.cfg.RouterAddr,
+		RouterPort:           int(mc.cfg.RouterPort),
+		StatePollingInterval: mc.cfg.StatePollingInterval,
 		OnConnectionLost:     mc.onConnectionLost,
 	}
-
-	mc.inner = ads.NewClient(settings, mc.newSlogAdapter())
-	return mc
+	if mc.hooks.OnStateChange != nil {
+		fn := mc.hooks.OnStateChange
+		settings.OnStateChange = func(_ *ads.Client, newState, oldState *adsstateinfo.SystemState) {
+			fn(newState, oldState)
+		}
+	}
+	return settings
 }
 
 // Connect establishes the ADS connection.
@@ -94,15 +121,7 @@ func (mc *ManagedClient) Reset() {
 	// exit instead of polling a dead connection forever.
 	close(mc.lostDone)
 	mc.lostDone = make(chan struct{})
-
-	settings := ads.ClientSettings{
-		TargetNetID:          mc.cfg.TargetNetID,
-		RouterHost:           mc.cfg.RouterAddr,
-		RouterPort:           int(mc.cfg.RouterPort),
-		StatePollingInterval: mc.cfg.StatePollingInterval,
-		OnConnectionLost:     mc.onConnectionLost,
-	}
-	mc.inner = ads.NewClient(settings, mc.newSlogAdapter())
+	mc.inner = ads.NewClient(mc.buildSettings(), mc.newSlogAdapter())
 }
 
 // Disconnect tears down the ADS connection and clears all subscriptions.
@@ -148,6 +167,11 @@ func (mc *ManagedClient) onConnectionLost(client *ads.Client, err error) {
 		zap.String("target_net_id", mc.cfg.TargetNetID),
 	)
 
+	// Notify the caller (e.g. adslogsreceiver) so it can emit an OTel system log.
+	if mc.hooks.OnConnectionLost != nil {
+		mc.hooks.OnConnectionLost(err)
+	}
+
 	// Capture done so that if Reset() replaces this client, we exit cleanly
 	// instead of leaking this goroutine.
 	done := mc.lostDone
@@ -165,13 +189,18 @@ func (mc *ManagedClient) onConnectionLost(client *ads.Client, err error) {
 		case <-tick.C:
 		}
 
-		state := client.GetCurrentState()
-		if state == nil || state.AdsState != 5 {
+		// Actively read state from the router instead of using the cached value.
+		// The cache was cleared to nil when this callback fired (restart-index or
+		// consecutive-failure path), and the state poller that would refresh it has
+		// been stopped. Using GetCurrentState() would loop forever on nil.
+		state, sErr := client.ReadTcSystemState()
+		if sErr != nil || state.AdsState != 5 {
 			continue
 		}
 
 		// TwinCAT is in Run state. Attempt reconnect.
 		if mc.reconnectFn == nil {
+			client.RestartStatePoller()
 			return
 		}
 		if rErr := mc.reconnectFn(client); rErr != nil {
@@ -182,6 +211,8 @@ func (mc *ManagedClient) onConnectionLost(client *ads.Client, err error) {
 			)
 			continue
 		}
+		// Re-arm the state poller so the next PLC activation is also detected.
+		client.RestartStatePoller()
 		mc.zapLogger.Info("Reconnected successfully after TwinCAT restart",
 			zap.String("target_net_id", mc.cfg.TargetNetID),
 		)
