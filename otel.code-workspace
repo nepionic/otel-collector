@@ -1,10 +1,16 @@
 {
 	"folders": [
 		{
+			"path": "../../siyka/ads-go"
+		},
+		{
 			"path": "."
 		},
 		{
-			"path": "../../siyka/ads-go"
+			"path": "../metrics"
+		},
+		{
+			"path": "../log"
 		}
 	]
 }

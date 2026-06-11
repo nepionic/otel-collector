@@ -342,26 +342,25 @@ func (r *metricsReceiver) pullValueToMetric(
 
 	pTs := pcommon.NewTimestampFromTime(ts)
 
+	var dp pmetric.NumberDataPoint
 	switch sub.Type {
 	case MetricTypeCounter:
 		sum := m.SetEmptySum()
 		sum.SetIsMonotonic(true)
 		sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-		dp := sum.DataPoints().AppendEmpty()
-		dp.SetDoubleValue(f64)
-		dp.SetTimestamp(pTs)
+		dp = sum.DataPoints().AppendEmpty()
 	case MetricTypeUpDownCounter:
 		sum := m.SetEmptySum()
 		sum.SetIsMonotonic(false)
 		sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-		dp := sum.DataPoints().AppendEmpty()
-		dp.SetDoubleValue(f64)
-		dp.SetTimestamp(pTs)
+		dp = sum.DataPoints().AppendEmpty()
 	default: // gauge
-		g := m.SetEmptyGauge()
-		dp := g.DataPoints().AppendEmpty()
-		dp.SetDoubleValue(f64)
-		dp.SetTimestamp(pTs)
+		dp = m.SetEmptyGauge().DataPoints().AppendEmpty()
+	}
+	dp.SetDoubleValue(f64)
+	dp.SetTimestamp(pTs)
+	for k, v := range sub.Attributes {
+		dp.Attributes().PutStr(k, v)
 	}
 
 	return md
@@ -394,7 +393,7 @@ func (r *metricsReceiver) resolvePushRingSymbol() error {
 }
 
 func (r *metricsReceiver) subscribePushRing() error {
-	wiPath := r.cfg.PushRing.Symbol + ".header.write_index"
+	wiPath := r.cfg.PushRing.Symbol + ".head"
 
 	cb := func(data ads.SubscriptionData) {
 		wi, ok := data.Value.(uint32)

@@ -35,6 +35,15 @@ type SubscriptionConfig struct {
 	CycleTime time.Duration `mapstructure:"cycle_time"`
 	// SendOnChange only emits a data point when the value changes (default: true).
 	SendOnChange bool `mapstructure:"send_on_change"`
+	// Attributes are static key/value pairs stamped onto every data point for
+	// this subscription. Use these to add dimensionality when subscribing to
+	// the same metric on multiple axes, stations, or products.
+	//
+	// Example:
+	//   attributes:
+	//     axis.id: "3"
+	//     axis.name: "feed"
+	Attributes map[string]string `mapstructure:"attributes"`
 }
 
 // PushRingConfig controls the optional push ring buffer path.

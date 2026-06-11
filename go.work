@@ -3,5 +3,5 @@ go 1.25.0
 use (
 	.
 	./dist
-	c:/Users/malleblas/workspaces/siyka/ads-go
+	../../siyka/ads-go
 )
