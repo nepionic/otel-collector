@@ -1,0 +1,150 @@
+# otelcol-ads collector configuration – writes to local log files.
+#
+# Run the collector:
+#   $env:GRAFANA_CLOUD_ENDPOINT="https://otlp-gateway-prod-<your-region>.grafana.net/otlp"
+#   $env:GRAFANA_CLOUD_INSTANCE_ID="<your-grafana-cloud-instance-id>"
+#   $env:GRAFANA_CLOUD_API_TOKEN="<your-grafana-cloud-api-token>"
+#   $env:OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic <base64(instance_id:api_token)>"
+#   $env:SITE_REGION="Irken Empire"
+#   $env:SITE_ID="processing-plant-03"
+#   $env:MACHINE_ID="nepionic-log-ads-go-otel-test"
+#   .\dist\otelcol-ads.exe --config .\config-file-logging.yaml
+
+extensions:
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+  basicauth/grafana_cloud:
+    client_auth:
+      username: "${GRAFANA_CLOUD_INSTANCE_ID}"
+      password: "${GRAFANA_CLOUD_API_TOKEN}"
+
+receivers:
+  # ---------------------------------------------------------------------------
+  # ADS Logs receiver – reads from the TwinCAT OtelBridge log ring buffer.
+  # ---------------------------------------------------------------------------
+  adsevents:
+    target_net_id: "199.4.42.250.1.1"   # AMS Net ID of the TwinCAT system
+    plc_port: 851
+    # router_addr: "192.168.1.1"        # Set for direct TCP (no local TwinCAT router)
+    router_port: 48898
+    state_polling_interval: 2s
+    subscription_cycle_time: 100ms
+    connect_retry_initial_interval: 1s  # first backoff after a failed attempt
+    connect_retry_max_interval: 30s     # backoff ceiling (doubles each attempt)
+
+  # ---------------------------------------------------------------------------
+  # ADS Metrics receiver – two complementary paths.
+  # ---------------------------------------------------------------------------
+  adsmetrics:
+    target_net_id: "199.4.42.250.1.1"
+    # router_addr: "192.168.1.1"
+    router_port: 48898
+    plc_port: 851
+    state_polling_interval: 2s
+    connect_retry_initial_interval: 1s
+    connect_retry_max_interval: 30s
+
+    # Pull path – no direct ADS subscriptions needed; all metrics flow via the
+    # push ring written by FilterSimulation / OTelMetricCore.
+    # Uncomment and extend if you need additional one-off symbol subscriptions:
+    # subscriptions:
+    #   - symbol: "Main.some_extra_value"
+    #     name: "filter.extra"
+    #     unit: "1"
+    #     type: gauge
+    #     cycle_time: 1s
+    #     send_on_change: true
+
+    # Push path – reads from the OTelMetricRing published by the integration
+    # test program.  The ring is written every real-second by Main's metric_timer.
+    #
+    # ADS symbol layout:
+    #   filter.flow_rate              L/min   Gauge   Pump output flow
+    #   filter.pressure.inlet         bar     Gauge   Pressure before filter bank
+    #   filter.pressure.outlet        bar     Gauge   Pressure after filter bank
+    #   filter.pressure.differential  bar     Gauge   Inlet − Outlet; rises with blockage
+    #   filter.blockage_fraction      1       Gauge   0.0 (clean) → ~0.52 (triggers backwash)
+    #   filter.backwash.cycles_total  {cycles} Counter Monotonic cycle count
+    #   filter.valve.backwash_active  1       Gauge   0/1 per module, attr: module=A|B
+    push_ring:
+      enabled: true
+      symbol: "Main.metric_ring"
+      subscription_cycle_time: 100ms
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+  batch:
+    send_batch_size: 1000
+    timeout: 1s
+
+  # Stamp every log/metric with site-specific metadata the PLC cannot supply.
+  # Values can be literals or ${env:VAR_NAME} references (resolved at startup).
+  resource:
+    attributes:
+      - key: site.id
+        value: "${env:SITE_ID}"
+        action: upsert
+      - key: machine.ids
+        value: "${env:MACHINE_ID}"
+        action: upsert
+      # - key: site.name
+      #   value: "Acme Plant 3"
+      #   action: upsert
+      # - key: machine.id
+      #   value: "${env:MACHINE_ID}"
+      #   action: upsert
+
+exporters:
+  # Write logs to a local file in OTLP JSON format.
+  file/logs:
+    path: ./logs/ads-logs.jsonl
+    rotation:
+      max_megabytes: 64
+      max_days: 7
+      max_backups: 5
+      localtime: true
+
+  # Write metrics to a separate local file in OTLP JSON format.
+  file/metrics:
+    path: ./logs/ads-metrics.jsonl
+    rotation:
+      max_megabytes: 64
+      max_days: 7
+      max_backups: 5
+      localtime: true
+
+  # Print everything to stdout for local development / debugging.
+  debug:
+    verbosity: detailed
+
+  # Send everything to an OTLP-compatible backend (Grafana, Jaeger, etc.)
+  otlphttp/grafana_cloud:
+    endpoint: "${GRAFANA_CLOUD_ENDPOINT}"
+    auth:
+      authenticator: basicauth/grafana_cloud
+    tls:
+      insecure: false
+
+service:
+  extensions: [basicauth/grafana_cloud, zpages]
+
+  pipelines:
+    logs:
+      receivers: [adsevents]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlphttp/grafana_cloud, file/logs, debug]
+
+    # metrics:
+    #   receivers: [adsmetrics]
+    #   processors: [memory_limiter, resource, batch]
+    #   exporters: [file/metrics, debug]
+
+    metrics:
+      receivers: [adsmetrics]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlphttp/grafana_cloud, file/metrics, debug]
