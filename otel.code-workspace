@@ -7,9 +7,6 @@
 			"path": "."
 		},
 		{
-			"path": "../metrics"
-		},
-		{
 			"path": "../log"
 		}
 	]
