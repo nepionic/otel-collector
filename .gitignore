@@ -18,6 +18,8 @@ vendor/
 # Local collector configs with real credentials
 config.yaml
 config-local.yaml
+config-file-logging.yaml
+config-grafana-cloud.yaml
 
 # Log output from local runs
 logs/
