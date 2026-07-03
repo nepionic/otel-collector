@@ -16,16 +16,18 @@ coverage.txt
 vendor/
 
 # Local collector configs with real credentials
-config.yaml
-config-local.yaml
-config-file-logging.yaml
-config-grafana-cloud.yaml
+config*.yaml
+!config-example.yaml
+
+# Local builder overrides (machine-specific replace directives)
+builder-config.local.yaml
 
 # Log output from local runs
 logs/
 
 # Editor / OS
 .vscode/settings.json
+*.code-workspace
 .idea/
 *.swp
 *.swo
