@@ -1,7 +1,7 @@
 # Example otelcol-ads collector configuration.
 #
 # Run the collector:
-#   ./dist/otelcol-ads --config config.yaml
+#   ./dist/otelcol-ads --config config-example.yaml
 
 extensions:
   zpages:
@@ -9,76 +9,79 @@ extensions:
 
 receivers:
   # ---------------------------------------------------------------------------
-  # ADS Logs receiver – reads from the TwinCAT OtelBridge log ring buffer.
-  # The companion library wraps FB_TcEventLogger and writes records into
-  # OtelBridge.LogRing (ST_OtelLogRing).
+  # ADS receiver – shares one ADS connection between the logs and metrics
+  # signals below (both reference this same `ads` receiver ID in the
+  # pipelines further down).
   # ---------------------------------------------------------------------------
-  adsevents:
-    target_net_id: "192.168.1.1.1.1"   # AMS Net ID of the TwinCAT system
+  ads:
+    target_net_id: "192.168.1.1.1.1"    # AMS Net ID of the TwinCAT system
     plc_port: 851
     # router_addr: "192.168.1.1"        # Set for direct TCP (no local TwinCAT router)
     router_port: 48898
     state_polling_interval: 2s
-    subscription_cycle_time: 100ms
     connect_retry_initial_interval: 1s  # first backoff after a failed attempt
     connect_retry_max_interval: 30s     # backoff ceiling (doubles each attempt)
 
-    # System logs – collector-generated events the PLC cannot supply itself:
-    #   - TwinCAT ADS state changes  (Run ↔ Stop, Config, Error, …)
-    #   - TCP connection established / lost / reconnected after restart
-    #   - Log ring buffer overflows  (PLC writing faster than collector drains)
-    # All sub-options default to true; set enabled: false to silence all of them.
-    system_logs:
-      enabled: true
+    # ---------------------------------------------------------------------
+    # Logs signal. Omit this whole block to disable the logs signal for
+    # this receiver instance.
+    # ---------------------------------------------------------------------
+    logs:
+      # Collector-generated events the PLC cannot supply itself. These work
+      # independently of push_ring below (they still fire even if the ring
+      # path is disabled). All default to true except twincat_logger.
       plc_state_changes: true   # Run→Stop, Config→Run, initial state, …
       connection_events: true   # connected, connection lost, reconnected
-      ring_overflows: true      # warn when PLC ring laps the collector
+      twincat_logger: true      # TwinCAT system logger (port 100): TCNC, PLC task mgr, services
 
-  # ---------------------------------------------------------------------------
-  # ADS Metrics receiver – two complementary paths.
-  # ---------------------------------------------------------------------------
-  adsmetrics:
-    target_net_id: "192.168.1.1.1.1"
-    plc_port: 851
-    # router_addr: "192.168.1.1"
-    router_port: 48898
-    state_polling_interval: 2s
-    connect_retry_initial_interval: 1s
-    connect_retry_max_interval: 30s
+      # Reads from the TwinCAT OtelBridge log ring buffer. The companion
+      # library wraps FB_TcEventLogger and writes records into
+      # OtelBridge.LogRing (ST_OtelLogRing). Set enabled: false to rely
+      # solely on the collector-generated events above, without requiring
+      # the PLC-side log ring library at all.
+      push_ring:
+        enabled: true
+        subscription_cycle_time: 100ms
+        ring_overflows: true   # warn when PLC ring laps the collector
 
-    # Pull path – subscribe to named PLC symbols directly.
-    # Add or remove entries as needed; no PLC-side companion library required.
-    subscriptions:
-      - symbol: "MAIN.temperature"
-        name: "plc.reactor.temperature"
-        unit: "Cel"
-        description: "Reactor temperature sensor"
-        type: gauge
-        cycle_time: 500ms
-        send_on_change: true
+    # ---------------------------------------------------------------------
+    # Metrics signal – two complementary paths. Omit this whole block to
+    # disable the metrics signal for this receiver instance.
+    # ---------------------------------------------------------------------
+    metrics:
+      # Pull path – subscribe to named PLC symbols directly.
+      # Add or remove entries as needed; no PLC-side companion library required.
+      subscriptions:
+        - symbol: "MAIN.temperature"
+          name: "plc.reactor.temperature"
+          unit: "Cel"
+          description: "Reactor temperature sensor"
+          type: gauge
+          cycle_time: 500ms
+          send_on_change: true
 
-      - symbol: "MAIN.production_count"
-        name: "plc.production.items_total"
-        unit: "{items}"
-        description: "Total items produced since PLC start"
-        type: counter
-        cycle_time: 1s
-        send_on_change: true
+        - symbol: "MAIN.production_count"
+          name: "plc.production.items_total"
+          unit: "{items}"
+          description: "Total items produced since PLC start"
+          type: counter
+          cycle_time: 1s
+          send_on_change: true
 
-      - symbol: "MAIN.conveyor_speed"
-        name: "plc.conveyor.speed"
-        unit: "mm/s"
-        description: "Conveyor belt speed"
-        type: gauge
-        cycle_time: 200ms
-        send_on_change: true
+        - symbol: "MAIN.conveyor_speed"
+          name: "plc.conveyor.speed"
+          unit: "mm/s"
+          description: "Conveyor belt speed"
+          type: gauge
+          cycle_time: 200ms
+          send_on_change: true
 
-    # Push path – reads from the TwinCAT OtelBridge lock-free metric ring.
-    # Enable when the companion library is integrated in the PLC project.
-    push_ring:
-      enabled: false
-      symbol: "OtelBridge.MetricRing"
-      subscription_cycle_time: 100ms
+      # Push path – reads from the TwinCAT OtelBridge lock-free metric ring.
+      # Enable when the companion library is integrated in the PLC project.
+      push_ring:
+        enabled: false
+        symbol: "OtelBridge.MetricRing"
+        subscription_cycle_time: 100ms
 
 processors:
   memory_limiter:
@@ -123,11 +126,11 @@ service:
 
   pipelines:
     logs:
-      receivers: [adsevents]
+      receivers: [ads]
       processors: [memory_limiter, resource, batch]
       exporters: [otlp, debug]
 
     metrics:
-      receivers: [adsmetrics]
+      receivers: [ads]
       processors: [memory_limiter, resource, batch]
       exporters: [otlp, debug]
