@@ -39,4 +39,5 @@ processors:
   - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.149.0
   - gomod: go.opentelemetry.io/collector/processor/memorylimiterprocessor v0.149.0
   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourceprocessor v0.149.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/transformprocessor v0.149.0
 
