@@ -70,3 +70,41 @@ func FindLogRingSymbol(client *ads.Client, port uint16) (string, error) {
 
 	return "", fmt.Errorf("no OTelLogAppender or otelcol_role=log_ring symbol found: %w", ErrSymbolNotFound)
 }
+
+// FindMetricRingSymbol discovers the ADS path of the OTelMetricRing variable
+// using two strategies tried in order:
+//
+//  1. Attribute-based: scan the symbol table for a symbol with the pragma
+//     attribute {attribute 'otelcol_role' := 'metric_ring'}.
+//
+//  2. Type-based (fallback): scan the symbol table for a symbol whose type
+//     name ends with "OTelMetricRing" (case-insensitive) and return it
+//     directly. Unlike the log ring (a field owned by OTelLogAppender), the
+//     metric ring is a standalone variable that the PLC project assigns into
+//     OTelMetricCore via its Ring property, so no field suffix is appended.
+//
+// Returns ErrSymbolNotFound (wrapped) if neither strategy succeeds.
+func FindMetricRingSymbol(client *ads.Client, port uint16) (string, error) {
+	syms, err := client.UploadSymbols(port)
+	if err != nil {
+		return "", fmt.Errorf("FindMetricRingSymbol: upload failed: %w", err)
+	}
+
+	// Strategy 1: explicit pragma attribute on the ring variable itself.
+	for _, s := range syms {
+		for _, a := range s.Attributes {
+			if a.Name == "otelcol_role" && strings.EqualFold(a.Value, "metric_ring") {
+				return s.Name, nil
+			}
+		}
+	}
+
+	// Strategy 2: find a variable declared as (namespace-qualified) OTelMetricRing.
+	for _, s := range syms {
+		if strings.HasSuffix(strings.ToLower(s.Type), "otelmetricring") {
+			return s.Name, nil
+		}
+	}
+
+	return "", fmt.Errorf("no OTelMetricRing or otelcol_role=metric_ring symbol found: %w", ErrSymbolNotFound)
+}

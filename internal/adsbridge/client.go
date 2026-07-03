@@ -1,5 +1,5 @@
-// Package adsbridge provides a shared ADS client wrapper used by both
-// the adslogsreceiver and adsmetricsreceiver packages.
+// Package adsbridge provides a shared ADS client wrapper used by the
+// adsreceiver package's logs and metrics signals.
 package adsbridge
 
 import (
@@ -167,7 +167,7 @@ func (mc *ManagedClient) onConnectionLost(client *ads.Client, err error) {
 		zap.String("target_net_id", mc.cfg.TargetNetID),
 	)
 
-	// Notify the caller (e.g. adslogsreceiver) so it can emit an OTel system log.
+	// Notify the caller (adsCore, fanning out to the logs signal) so it can emit an OTel system log.
 	if mc.hooks.OnConnectionLost != nil {
 		mc.hooks.OnConnectionLost(err)
 	}
