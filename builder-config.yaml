@@ -2,7 +2,14 @@
 #
 # Build the custom collector binary:
 #   go install go.opentelemetry.io/collector/cmd/builder@v0.149.0
-#   builder --config builder-config.yaml
+#
+#   ocb's --config flag takes a single file (repeating it just overrides the
+#   previous value, it does not merge), so concatenate the two configs first:
+#     Get-Content builder-config.yaml, builder-config.local.yaml | Set-Content merged.yaml
+#     builder --config merged.yaml
+#
+# builder-config.local.yaml is gitignored and holds `replaces:` for any local
+# (unpublished) modules.  Copy builder-config.local.yaml.example to get started.
 #
 # Output: ./dist/otelcol-ads  (Windows: ./dist/otelcol-ads.exe)
 
@@ -18,13 +25,8 @@ extensions:
 
 receivers:
   - gomod: github.com/nepionic/otelcol-ads v0.1.0
-    import: github.com/nepionic/otelcol-ads/receiver/adslogsreceiver
-    name: adslogsreceiver
-    path: ./
-
-  - gomod: github.com/nepionic/otelcol-ads v0.1.0
-    import: github.com/nepionic/otelcol-ads/receiver/adsmetricsreceiver
-    name: adsmetricsreceiver
+    import: github.com/nepionic/otelcol-ads/receiver/adsreceiver
+    name: adsreceiver
     path: ./
 
 exporters:
@@ -37,3 +39,4 @@ processors:
   - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.149.0
   - gomod: go.opentelemetry.io/collector/processor/memorylimiterprocessor v0.149.0
   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourceprocessor v0.149.0
+
