@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/receiver"
+	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 )
 
@@ -39,19 +40,30 @@ type logsSignal struct {
 
 	wiCh chan uint32 // write_index notifications feed this channel
 
+	// ringOverflowCounter is the self-telemetry counter for ring buffer
+	// overflows (see telemetry.go). May be nil if instrument creation failed.
+	ringOverflowCounter metric.Int64Counter
+
 	// TwinCAT system logger (port 100) subscription.
 	loggerCancel context.CancelFunc
 	loggerWg     sync.WaitGroup
 }
 
 func newLogsSignal(cfg *LogsConfig, core *adsCore, set receiver.Settings, next consumer.Logs) *logsSignal {
+	logger := set.TelemetrySettings.Logger
+	counter, err := newRingOverflowCounter(set.TelemetrySettings.MeterProvider)
+	if err != nil {
+		logger.Warn("Failed to create ring overflow self-telemetry counter", zap.Error(err))
+		counter = nil
+	}
 	return &logsSignal{
-		cfg:    cfg,
-		core:   core,
-		set:    set,
-		next:   next,
-		logger: set.TelemetrySettings.Logger,
-		wiCh:   make(chan uint32, 64),
+		cfg:                 cfg,
+		core:                core,
+		set:                 set,
+		next:                next,
+		logger:              logger,
+		wiCh:                make(chan uint32, 64),
+		ringOverflowCounter: counter,
 	}
 }
 
@@ -254,23 +266,6 @@ func (s *logsSignal) drain(newWI uint32) {
 		return
 	}
 
-	// Detect ring overflow before reading: if the PLC has written more than a
-	// full ring's worth of entries since our last drain, some will be lost.
-	if s.cfg.PushRing.RingOverflows {
-		if pending := newWI - lri; pending > adsbridge.LogCapacity {
-			lost := pending - adsbridge.LogCapacity/2
-			s.emitSystemLog(
-				plog.SeverityNumberWarn, "WARN",
-				"ads.ring.overflow",
-				fmt.Sprintf("Log ring buffer overflowed: ~%d entries lost", lost),
-				func(m pcommon.Map) {
-					m.PutInt("ads.ring.lost_count", int64(lost))
-					m.PutInt("ads.ring.capacity", int64(adsbridge.LogCapacity))
-				},
-			)
-		}
-	}
-
 	s.wmu.Lock()
 	group := s.ringGroup
 	offset := s.ringOffset
@@ -287,8 +282,20 @@ func (s *logsSignal) drain(newWI uint32) {
 		return
 	}
 
-	slots, newRI := adsbridge.DrainLogs(rawRing, lri, newWI)
+	slots, newRI, plcOverflowCnt := adsbridge.DrainLogs(rawRing, lri, newWI)
 	atomic.StoreUint32(&s.localRI, newRI)
+
+	// Detect ring overflow: if the PLC has written more than a full ring's
+	// worth of entries since our last drain, some will be lost. This is
+	// self-telemetry (the health of our own collection mechanism, not the
+	// PLC), so it is reported via reportRingOverflow, not emitted as a log
+	// record into the business logs pipeline.
+	if s.cfg.PushRing.RingOverflows {
+		if pending := newWI - lri; pending > adsbridge.LogCapacity {
+			lost := pending - adsbridge.LogCapacity/2
+			reportRingOverflow(s.logger, s.ringOverflowCounter, "log", s.cfg.PushRing.Symbol, lost, adsbridge.LogCapacity, plcOverflowCnt)
+		}
+	}
 
 	if len(slots) == 0 {
 		return

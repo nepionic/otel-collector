@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/receiver"
+	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 )
 
@@ -38,16 +39,27 @@ type metricsSignal struct {
 	pushRingMu     sync.Mutex
 	pushSub        *ads.ActiveSubscription
 	pushWICh       chan uint32
+
+	// ringOverflowCounter is the self-telemetry counter for ring buffer
+	// overflows (see telemetry.go). May be nil if instrument creation failed.
+	ringOverflowCounter metric.Int64Counter
 }
 
 func newMetricsSignal(cfg *MetricsConfig, core *adsCore, set receiver.Settings, next consumer.Metrics) *metricsSignal {
+	logger := set.TelemetrySettings.Logger
+	counter, err := newRingOverflowCounter(set.TelemetrySettings.MeterProvider)
+	if err != nil {
+		logger.Warn("Failed to create ring overflow self-telemetry counter", zap.Error(err))
+		counter = nil
+	}
 	return &metricsSignal{
-		cfg:      cfg,
-		core:     core,
-		set:      set,
-		next:     next,
-		logger:   set.TelemetrySettings.Logger,
-		pushWICh: make(chan uint32, 64),
+		cfg:                 cfg,
+		core:                core,
+		set:                 set,
+		next:                next,
+		logger:              logger,
+		pushWICh:            make(chan uint32, 64),
+		ringOverflowCounter: counter,
 	}
 }
 
@@ -385,17 +397,14 @@ func (s *metricsSignal) drainPushRing(newWI uint32) {
 		)
 	}
 	if result.Overflows > 0 {
-		s.logger.Warn("Metric ring: consumer fell behind, slots lost",
-			zap.String("symbol", s.cfg.PushRing.Symbol),
-			zap.Uint32("lost_slots", result.Overflows),
-		)
+		reportRingOverflow(s.logger, s.ringOverflowCounter, "metric", s.cfg.PushRing.Symbol, result.Overflows, result.Capacity, result.OverflowCnt)
 	}
 
 	if len(result.Slots) == 0 {
 		return
 	}
 
-	md := s.pushSlotsToMetrics(result.Slots, result.OverflowCnt)
+	md := s.pushSlotsToMetrics(result.Slots)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -405,7 +414,7 @@ func (s *metricsSignal) drainPushRing(newWI uint32) {
 }
 
 // pushSlotsToMetrics converts a batch of push ring slots to pmetric.Metrics.
-func (s *metricsSignal) pushSlotsToMetrics(slots []adsbridge.MetricSlot, overflowCnt uint32) pmetric.Metrics {
+func (s *metricsSignal) pushSlotsToMetrics(slots []adsbridge.MetricSlot) pmetric.Metrics {
 	md := pmetric.NewMetrics()
 	rm := md.ResourceMetrics().AppendEmpty()
 	ra := rm.Resource().Attributes()
@@ -445,17 +454,6 @@ func (s *metricsSignal) pushSlotsToMetrics(slots []adsbridge.MetricSlot, overflo
 				dp.Attributes().PutStr(a.Key, a.Value)
 			}
 		}
-	}
-
-	// Emit the buffer overflow counter as a self-observability metric.
-	if overflowCnt > 0 {
-		om := sm.Metrics().AppendEmpty()
-		om.SetName("otelcol_ads.push_ring.overflow_total")
-		om.SetDescription("Total number of metric ring buffer overflow events reported by the PLC")
-		g := om.SetEmptyGauge()
-		dp := g.DataPoints().AppendEmpty()
-		dp.SetIntValue(int64(overflowCnt))
-		dp.SetTimestamp(pcommon.NewTimestampFromTime(time.Now()))
 	}
 
 	return md
