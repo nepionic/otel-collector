@@ -1,0 +1,134 @@
+# Normalises ads-go's camelCase log attribute keys to snake_case, matching
+# the snake_case/dot.case style OTel semantic conventions use (and that most
+# other collector-emitted attributes already follow).
+#
+# ads-go (https://github.com/jarmocluyse/ads-go) is a Go ADS/TwinCAT client
+# library that logs internally via a structured, slog-compatible logger.
+# Its keys mirror its own Go identifiers (cycleTime, indexGroup, netID, ...),
+# which is idiomatic for a standalone Go library but reads inconsistently
+# once those logs are bridged into an OTel collector and shipped alongside
+# attributes that follow OTel's own naming convention.
+#
+# Why normalise downstream instead of patching the library: a sweeping,
+# purely-stylistic rename of every log key is unrelated to genuine bug fixes
+# and makes upstreaming real fixes (missing context, noisy log levels, etc.)
+# harder to review if bundled together. Keeping style preferences out of the
+# library and handling them in your own collector pipeline instead keeps a
+# fork's diff minimal and upstream-friendly.
+#
+# WHERE TO WIRE THIS IN:
+#
+# A Go program that embeds ads-go typically bridges its slog-style logging
+# into the host collector's own logger (e.g. zap), which usually only
+# reaches OTLP via that collector's self-telemetry (service::telemetry::logs)
+# - not its regular business logs: pipeline. Self-telemetry's `processors:`
+# list only accepts the OTel SDK's own `batch`/`simple` log-record-processor
+# types (see the LogRecordProcessor schema in any recent
+# opentelemetry-configuration/contrib-otelconf release) - it is structurally
+# impossible to attach a collector component like `transform` there.
+#
+# So this needs to be wired into the pipeline of whatever collector
+# *receives* that self-telemetry data as regular incoming OTLP - typically an
+# upstream/aggregation collector with an `otlp` receiver on its own `logs:`
+# pipeline. By the time the data arrives there it's just regular incoming
+# OTLP, subject to the full processor chain like anything else:
+#
+#   processors:
+#     transform/normalise_ads_go_keys:
+#       <paste the transform/normalise_ads_go_keys block below>
+#
+#   service:
+#     pipelines:
+#       logs:
+#         receivers: [otlp]
+#         processors: [transform/normalise_ads_go_keys, batch]
+#         exporters: [<your log backend>]
+#
+# Note: `transformprocessor` is a contrib-only component - it isn't included
+# in the OTel Collector core distribution/image, only in
+# opentelemetry-collector-contrib or a custom build that includes it (see
+# prerequisite below).
+#
+# Scoped via the `conditions:` block (a list of where-clauses, ORed together,
+# gating the whole statement group - see transformprocessor's README
+# "Advanced Config") to resource.attributes["service.name"] == "otelcol-ads".
+# Adjust that value to match whatever service.name your own ads-go-embedding
+# collector actually reports, so this only touches its logs and leaves every
+# other service landing on the same upstream collector alone.
+#
+# Prerequisite for a custom (ocb) build - not needed if you're running a
+# stock opentelemetry-collector-contrib image, which already bundles it:
+#   processors:
+#     - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/transformprocessor v0.149.0
+#
+# OTTL has no generic camelCase -> snake_case string function, so this is one
+# set()/delete_key() pair per key rather than a single rule. Excludes
+# OnStateChange/OnConnectionLost/OnDisconnect/ReadValue/WriteValue - those are
+# *values* referencing real exported Go identifiers (hook/method names), not
+# generic keys, and shouldn't be rewritten.
+
+processors:
+  transform/normalise_ads_go_keys:
+    log_statements:
+      - context: log
+        conditions:
+          - resource.attributes["service.name"] == "otelcol-ads"
+        statements:
+          - set(attributes["consecutive_failures"], attributes["consecutiveFailures"]) where attributes["consecutiveFailures"] != nil
+          - delete_key(attributes, "consecutiveFailures")
+          - set(attributes["current_id"], attributes["currentID"]) where attributes["currentID"] != nil
+          - delete_key(attributes, "currentID")
+          - set(attributes["cycle_time"], attributes["cycleTime"]) where attributes["cycleTime"] != nil
+          - delete_key(attributes, "cycleTime")
+          - set(attributes["device_info"], attributes["deviceInfo"]) where attributes["deviceInfo"] != nil
+          - delete_key(attributes, "deviceInfo")
+          - set(attributes["device_state"], attributes["deviceState"]) where attributes["deviceState"] != nil
+          - delete_key(attributes, "deviceState")
+          - set(attributes["error_code"], attributes["errorCode"]) where attributes["errorCode"] != nil
+          - delete_key(attributes, "errorCode")
+          - set(attributes["error_desc"], attributes["errorDesc"]) where attributes["errorDesc"] != nil
+          - delete_key(attributes, "errorDesc")
+          - set(attributes["from_device_state"], attributes["fromDeviceState"]) where attributes["fromDeviceState"] != nil
+          - delete_key(attributes, "fromDeviceState")
+          - set(attributes["from_state"], attributes["fromState"]) where attributes["fromState"] != nil
+          - delete_key(attributes, "fromState")
+          - set(attributes["index_group"], attributes["indexGroup"]) where attributes["indexGroup"] != nil
+          - delete_key(attributes, "indexGroup")
+          - set(attributes["index_offset"], attributes["indexOffset"]) where attributes["indexOffset"] != nil
+          - delete_key(attributes, "indexOffset")
+          - set(attributes["invoke_id"], attributes["invokeID"]) where attributes["invokeID"] != nil
+          - delete_key(attributes, "invokeID")
+          - set(attributes["is_raw"], attributes["isRaw"]) where attributes["isRaw"] != nil
+          - delete_key(attributes, "isRaw")
+          - set(attributes["local_ams"], attributes["localAMS"]) where attributes["localAMS"] != nil
+          - delete_key(attributes, "localAMS")
+          - set(attributes["local_port"], attributes["localPort"]) where attributes["localPort"] != nil
+          - delete_key(attributes, "localPort")
+          - set(attributes["max_failures"], attributes["maxFailures"]) where attributes["maxFailures"] != nil
+          - delete_key(attributes, "maxFailures")
+          - set(attributes["net_id"], attributes["netID"]) where attributes["netID"] != nil
+          - delete_key(attributes, "netID")
+          - set(attributes["poller_id"], attributes["pollerID"]) where attributes["pollerID"] != nil
+          - delete_key(attributes, "pollerID")
+          - set(attributes["previous_restart_index"], attributes["previousRestartIndex"]) where attributes["previousRestartIndex"] != nil
+          - delete_key(attributes, "previousRestartIndex")
+          - set(attributes["read_length"], attributes["readLength"]) where attributes["readLength"] != nil
+          - delete_key(attributes, "readLength")
+          - set(attributes["restart_index"], attributes["restartIndex"]) where attributes["restartIndex"] != nil
+          - delete_key(attributes, "restartIndex")
+          - set(attributes["router_addr"], attributes["routerAddr"]) where attributes["routerAddr"] != nil
+          - delete_key(attributes, "routerAddr")
+          - set(attributes["send_on_change"], attributes["sendOnChange"]) where attributes["sendOnChange"] != nil
+          - delete_key(attributes, "sendOnChange")
+          - set(attributes["stamp_count"], attributes["stampCount"]) where attributes["stampCount"] != nil
+          - delete_key(attributes, "stampCount")
+          - set(attributes["target_port"], attributes["targetPort"]) where attributes["targetPort"] != nil
+          - delete_key(attributes, "targetPort")
+          - set(attributes["to_device_state"], attributes["toDeviceState"]) where attributes["toDeviceState"] != nil
+          - delete_key(attributes, "toDeviceState")
+          - set(attributes["to_state"], attributes["toState"]) where attributes["toState"] != nil
+          - delete_key(attributes, "toState")
+          - set(attributes["total_packet_length"], attributes["totalPacketLength"]) where attributes["totalPacketLength"] != nil
+          - delete_key(attributes, "totalPacketLength")
+          - set(attributes["write_length"], attributes["writeLength"]) where attributes["writeLength"] != nil
+          - delete_key(attributes, "writeLength")
