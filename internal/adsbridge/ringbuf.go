@@ -133,6 +133,7 @@ type DrainResult struct {
 	TornReads   uint32 // slots skipped due to odd sequence (mid-write during ADS read)
 	Overflows   uint32 // slots skipped due to generation mismatch (ring lapped consumer)
 	OverflowCnt uint32 // overflow_cnt value from ring header
+	Capacity    uint32 // ring capacity (slot count) used for this drain
 }
 
 // DrainMetrics parses new metric slots from a raw ring buffer snapshot.
@@ -161,6 +162,7 @@ func DrainMetrics(rawRing []byte, localRI uint32, newWI uint32) (DrainResult, ui
 	if capacity == 0 {
 		capacity = 2048 // sane fallback
 	}
+	result.Capacity = capacity
 
 	// Detect consumer falling too far behind (ring has lapped us).
 	pendingCount := newWI - localRI
@@ -356,15 +358,18 @@ func ParseLogSlot(b []byte) (LogSlot, error) {
 	}, nil
 }
 
-// DrainLogs parses new log slots from a raw log ring buffer snapshot.
-func DrainLogs(rawRing []byte, localRI uint32, newWI uint32) ([]LogSlot, uint32) {
+// DrainLogs parses new log slots from a raw log ring buffer snapshot. The
+// third return value is the ring header's own overflow_cnt (a cumulative
+// counter the PLC maintains), for callers that want to surface it alongside
+// consumer-side overflow detection.
+func DrainLogs(rawRing []byte, localRI uint32, newWI uint32) ([]LogSlot, uint32, uint32) {
 	if newWI == localRI {
-		return nil, localRI
+		return nil, localRI, 0
 	}
 
 	header, err := ParseMetricRingHeader(rawRing) // header layout is identical
 	if err != nil {
-		return nil, localRI
+		return nil, localRI, 0
 	}
 
 	capacity := header.Capacity
@@ -403,7 +408,7 @@ func DrainLogs(rawRing []byte, localRI uint32, newWI uint32) ([]LogSlot, uint32)
 		// log loss is preferable to corrupted messages.
 	}
 
-	return slots, newWI
+	return slots, newWI, header.OverflowCnt
 }
 
 // nullTermString converts a fixed-length byte slice to a Go string, stopping
