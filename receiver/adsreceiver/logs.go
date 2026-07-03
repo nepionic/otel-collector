@@ -82,7 +82,7 @@ func (s *logsSignal) trySubscribe() (netErr error, done bool) {
 				s.logger.Warn("TCP connection dropped during symbol discovery", zap.Error(err))
 				return err, false
 			}
-			s.logger.Info("Log ring symbol not yet discovered; waiting",
+			s.logger.Debug("Log ring symbol not yet discovered; waiting",
 				zap.Error(err),
 				zap.Duration("retry_in", s.core.cfg.StatePollingInterval),
 			)
@@ -94,10 +94,10 @@ func (s *logsSignal) trySubscribe() (netErr error, done bool) {
 
 	if err := s.resolveRingSymbol(client, plcPort); err != nil {
 		if adsbridge.IsNetworkError(err) {
-			s.logger.Warn("TCP connection dropped during symbol lookup", zap.Error(err))
+			s.logger.Warn("TCP connection dropped during symbol lookup", zap.String("symbol", s.cfg.PushRing.Symbol), zap.Error(err))
 			return err, false
 		}
-		s.logger.Info("Log ring symbol not yet available; waiting",
+		s.logger.Debug("Log ring symbol not yet available; waiting",
 			zap.String("symbol", s.cfg.PushRing.Symbol),
 			zap.Duration("retry_in", s.core.cfg.StatePollingInterval),
 		)
@@ -106,16 +106,16 @@ func (s *logsSignal) trySubscribe() (netErr error, done bool) {
 
 	if err := s.subscribe(client, plcPort); err != nil {
 		if adsbridge.IsNetworkError(err) {
-			s.logger.Warn("TCP connection dropped during subscribe", zap.Error(err))
+			s.logger.Warn("TCP connection dropped during subscribe", zap.String("symbol", s.cfg.PushRing.Symbol), zap.Error(err))
 			return err, false
 		}
-		s.logger.Warn("Subscribe failed; retrying", zap.Error(err))
+		s.logger.Warn("Subscribe failed; retrying", zap.String("symbol", s.cfg.PushRing.Symbol), zap.Error(err))
 		return nil, false
 	}
 
 	s.logger.Info("ADS logs signal subscribed",
 		zap.String("target_net_id", s.core.cfg.TargetNetID),
-		zap.String("ring_symbol", s.cfg.PushRing.Symbol),
+		zap.String("symbol", s.cfg.PushRing.Symbol),
 	)
 	s.startTCLogger(client)
 	s.core.wg.Add(1)
@@ -283,7 +283,7 @@ func (s *logsSignal) drain(newWI uint32) {
 
 	rawRing, err := s.core.client.Client().ReadRaw(s.core.cfg.PLCPort, group, offset, size)
 	if err != nil {
-		s.logger.Warn("ReadRaw log ring failed", zap.Error(err))
+		s.logger.Warn("ReadRaw log ring failed", zap.String("symbol", s.cfg.PushRing.Symbol), zap.Error(err))
 		return
 	}
 
@@ -522,9 +522,11 @@ func (s *logsSignal) startTCLogger(client *ads.Client) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.loggerCancel = cancel
 
-	ch, err := adslogger.Subscribe(ctx, client)
+	ch, err := adslogger.Subscribe(ctx, client, adslogger.Options{
+		Logger: adsbridge.NewZapSlogAdapter(s.logger, "[ads-logger] "),
+	})
 	if err != nil {
-		s.logger.Warn("Failed to subscribe to TwinCAT system logger", zap.Error(err))
+		s.logger.Warn("Failed to subscribe to TwinCAT system logger", zap.String("target_net_id", s.core.cfg.TargetNetID), zap.Error(err))
 		cancel()
 		s.loggerCancel = nil
 		return

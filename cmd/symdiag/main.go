@@ -2,6 +2,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"strings"
@@ -11,10 +12,20 @@ import (
 )
 
 func main() {
+	targetNetID := flag.String("target-net-id", "", "AMS Net ID of the target TwinCAT system (required)")
+	routerHost := flag.String("router-host", "127.0.0.1", "Hostname or IP of the ADS router")
+	routerPort := flag.Int("router-port", 48898, "TCP port of the ADS router")
+	plcPort := flag.Int("plc-port", 851, "ADS port of the PLC runtime")
+	flag.Parse()
+
+	if *targetNetID == "" {
+		log.Fatal("missing required -target-net-id flag")
+	}
+
 	settings := ads.ClientSettings{
-		TargetNetID: "199.4.42.250.1.1",
-		RouterHost:  "127.0.0.1",
-		RouterPort:  48898,
+		TargetNetID: *targetNetID,
+		RouterHost:  *routerHost,
+		RouterPort:  *routerPort,
 	}
 	client := ads.NewClient(settings, nil)
 	if err := client.Connect(); err != nil {
@@ -23,8 +34,7 @@ func main() {
 	defer client.Disconnect()
 	time.Sleep(200 * time.Millisecond)
 
-	const port = 851
-	syms, err := client.UploadSymbols(port)
+	syms, err := client.UploadSymbols(uint16(*plcPort))
 	if err != nil {
 		log.Fatalf("UploadSymbols: %v", err)
 	}

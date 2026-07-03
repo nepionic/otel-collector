@@ -77,7 +77,8 @@ func (s *metricsSignal) trySubscribe() (netErr error, done bool) {
 			if adsbridge.IsNetworkError(err) {
 				return err, false
 			}
-			s.logger.Info("PLC symbols not yet available; waiting",
+			s.logger.Debug("PLC symbols not yet available; waiting",
+				zap.Int("configured_subscriptions", len(s.cfg.Subscriptions)),
 				zap.Error(err),
 				zap.Duration("retry_in", s.core.cfg.StatePollingInterval),
 			)
@@ -96,7 +97,8 @@ func (s *metricsSignal) trySubscribe() (netErr error, done bool) {
 			if adsbridge.IsNetworkError(err) {
 				return err, false
 			}
-			s.logger.Info("Push ring symbol not yet available; waiting",
+			s.logger.Debug("Push ring symbol not yet available; waiting",
+				zap.String("symbol", s.cfg.PushRing.Symbol),
 				zap.Error(err),
 				zap.Duration("retry_in", s.core.cfg.StatePollingInterval),
 			)
@@ -369,7 +371,7 @@ func (s *metricsSignal) drainPushRing(newWI uint32) {
 
 	rawRing, err := s.core.client.Client().ReadRaw(s.core.cfg.PLCPort, group, offset, size)
 	if err != nil {
-		s.logger.Warn("ReadRaw metric ring failed", zap.Error(err))
+		s.logger.Warn("ReadRaw metric ring failed", zap.String("symbol", s.cfg.PushRing.Symbol), zap.Error(err))
 		return
 	}
 
@@ -378,11 +380,13 @@ func (s *metricsSignal) drainPushRing(newWI uint32) {
 
 	if result.TornReads > 0 {
 		s.logger.Debug("Metric ring: torn reads (mid-write during ADS read)",
+			zap.String("symbol", s.cfg.PushRing.Symbol),
 			zap.Uint32("count", result.TornReads),
 		)
 	}
 	if result.Overflows > 0 {
 		s.logger.Warn("Metric ring: consumer fell behind, slots lost",
+			zap.String("symbol", s.cfg.PushRing.Symbol),
 			zap.Uint32("lost_slots", result.Overflows),
 		)
 	}
@@ -396,7 +400,7 @@ func (s *metricsSignal) drainPushRing(newWI uint32) {
 	defer cancel()
 
 	if err := s.next.ConsumeMetrics(ctx, md); err != nil {
-		s.logger.Error("ConsumeMetrics (push) failed", zap.Error(err))
+		s.logger.Error("ConsumeMetrics (push) failed", zap.String("symbol", s.cfg.PushRing.Symbol), zap.Error(err))
 	}
 }
 

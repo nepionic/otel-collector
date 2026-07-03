@@ -205,7 +205,7 @@ func (mc *ManagedClient) onConnectionLost(client *ads.Client, err error) {
 		}
 		if rErr := mc.reconnectFn(client); rErr != nil {
 			// Symbols may not be deployed yet – keep polling until they appear.
-			mc.zapLogger.Info("Reconnect attempt failed, will retry on next poll",
+			mc.zapLogger.Warn("Reconnect attempt failed, will retry on next poll",
 				zap.Error(rErr),
 				zap.String("target_net_id", mc.cfg.TargetNetID),
 			)
@@ -225,15 +225,25 @@ func (mc *ManagedClient) onConnectionLost(client *ads.Client, err error) {
 // ---------------------------------------------------------------------------
 
 // zapSlogHandler adapts a *zap.Logger to the slog.Handler interface so that
-// ads-go's internal slog messages are forwarded to OTel's zap logger.
+// dependencies using log/slog (ads-go, ads-logger) forward their internal
+// diagnostics to OTel's zap logger.
 type zapSlogHandler struct {
 	logger *zap.Logger
+	prefix string
 	attrs  []slog.Attr
 	group  string
 }
 
+// NewZapSlogAdapter returns a *slog.Logger backed by logger, so any dependency
+// that accepts a *slog.Logger for its own internal diagnostics can be wired
+// into the receiver's zap logger instead of writing to a separate target.
+// prefix is prepended to every message (e.g. "[ads-go] ") to identify the source.
+func NewZapSlogAdapter(logger *zap.Logger, prefix string) *slog.Logger {
+	return slog.New(&zapSlogHandler{logger: logger, prefix: prefix})
+}
+
 func (mc *ManagedClient) newSlogAdapter() *slog.Logger {
-	return slog.New(&zapSlogHandler{logger: mc.zapLogger})
+	return NewZapSlogAdapter(mc.zapLogger, "[ads-go] ")
 }
 
 func (h *zapSlogHandler) Enabled(_ context.Context, level slog.Level) bool {
@@ -273,7 +283,7 @@ func (h *zapSlogHandler) Handle(_ context.Context, r slog.Record) error {
 		return true
 	})
 
-	h.logger.Log(zapLevel, "[ads-go] "+r.Message, fields...)
+	h.logger.Log(zapLevel, h.prefix+r.Message, fields...)
 	return nil
 }
 

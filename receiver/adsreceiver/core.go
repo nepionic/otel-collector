@@ -135,7 +135,8 @@ func (c *adsCore) connectLoop() {
 
 		if err := c.client.Connect(); err != nil {
 			c.logger.Warn("ADS connect failed",
-				zap.Duration("next_retry", backoff),
+				zap.String("target_net_id", c.cfg.TargetNetID),
+				zap.Duration("retry_in", backoff),
 				zap.Error(err),
 			)
 			select {
@@ -196,7 +197,7 @@ func (c *adsCore) subscribeLoop() bool {
 		if !logsDone {
 			netErr, done := c.logs.trySubscribe()
 			if netErr != nil {
-				c.logger.Warn("TCP connection dropped during logs setup", zap.Error(netErr))
+				c.logger.Warn("TCP connection dropped during logs setup", zap.String("target_net_id", c.cfg.TargetNetID), zap.Error(netErr))
 				return false
 			}
 			logsDone = done
@@ -205,7 +206,7 @@ func (c *adsCore) subscribeLoop() bool {
 		if !metricsDone {
 			netErr, done := c.metrics.trySubscribe()
 			if netErr != nil {
-				c.logger.Warn("TCP connection dropped during metrics setup", zap.Error(netErr))
+				c.logger.Warn("TCP connection dropped during metrics setup", zap.String("target_net_id", c.cfg.TargetNetID), zap.Error(netErr))
 				return false
 			}
 			metricsDone = done
