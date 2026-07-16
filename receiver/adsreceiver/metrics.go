@@ -40,9 +40,19 @@ type metricsSignal struct {
 	pushSub        *ads.ActiveSubscription
 	pushWICh       chan uint32
 
+	// heartbeatSub is a dedicated subscription directly on <symbol>.heartbeat
+	// (not gated by .head), so heartbeat reporting doesn't depend on how
+	// often unrelated push-ring traffic happens to drain. nil unless
+	// PushRing.Heartbeat is enabled.
+	heartbeatSub *ads.ActiveSubscription
+
 	// ringOverflowCounter is the self-telemetry counter for ring buffer
 	// overflows (see telemetry.go). May be nil if instrument creation failed.
 	ringOverflowCounter metric.Int64Counter
+
+	// heartbeatGauge is the self-telemetry gauge for the PLC-reported
+	// heartbeat (see telemetry.go). May be nil if instrument creation failed.
+	heartbeatGauge metric.Float64Gauge
 }
 
 func newMetricsSignal(cfg *MetricsConfig, core *adsCore, set receiver.Settings, next consumer.Metrics) *metricsSignal {
@@ -52,6 +62,11 @@ func newMetricsSignal(cfg *MetricsConfig, core *adsCore, set receiver.Settings, 
 		logger.Warn("Failed to create ring overflow self-telemetry counter", zap.Error(err))
 		counter = nil
 	}
+	gauge, err := newHeartbeatGauge(set.TelemetrySettings.MeterProvider)
+	if err != nil {
+		logger.Warn("Failed to create heartbeat self-telemetry gauge", zap.Error(err))
+		gauge = nil
+	}
 	return &metricsSignal{
 		cfg:                 cfg,
 		core:                core,
@@ -60,6 +75,7 @@ func newMetricsSignal(cfg *MetricsConfig, core *adsCore, set receiver.Settings, 
 		logger:              logger,
 		pushWICh:            make(chan uint32, 64),
 		ringOverflowCounter: counter,
+		heartbeatGauge:      gauge,
 	}
 }
 
@@ -149,6 +165,10 @@ func (s *metricsSignal) teardown() {
 	if s.pushSub != nil {
 		_ = client.Unsubscribe(s.pushSub)
 		s.pushSub = nil
+	}
+	if s.heartbeatSub != nil {
+		_ = client.Unsubscribe(s.heartbeatSub)
+		s.heartbeatSub = nil
 	}
 	s.pushRingMu.Unlock()
 }
@@ -301,7 +321,15 @@ func (s *metricsSignal) initPushRing(client *ads.Client) error {
 	if err := s.resolvePushRingSymbol(client); err != nil {
 		return err
 	}
-	return s.subscribePushRing(client)
+	if err := s.subscribePushRing(client); err != nil {
+		return err
+	}
+	if s.cfg.PushRing.Heartbeat {
+		if err := s.subscribeHeartbeat(client); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *metricsSignal) resolvePushRingSymbol(client *ads.Client) error {
@@ -351,6 +379,50 @@ func (s *metricsSignal) subscribePushRing(client *ads.Client) error {
 
 	s.pushRingMu.Lock()
 	s.pushSub = sub
+	s.pushRingMu.Unlock()
+	return nil
+}
+
+// subscribeHeartbeat sets up a dedicated ADS subscription directly on
+// <symbol>.heartbeat - deliberately independent of the .head subscription
+// above. Piggybacking heartbeat detection on the head-driven drain would tie
+// its freshness to how often unrelated push-ring traffic happens to occur on
+// this ring, which is unreliable in general (e.g. the log ring only drains
+// when a log entry is actually appended, which can be arbitrarily rare).
+// Subscribing to the heartbeat value directly means the ADS notification
+// itself delivers the new value - no ring re-read needed - on its own
+// cadence, matching whatever rate the PLC calls Heartbeat() at.
+func (s *metricsSignal) subscribeHeartbeat(client *ads.Client) error {
+	hbPath := s.cfg.PushRing.Symbol + ".heartbeat"
+
+	cb := func(data ads.SubscriptionData) {
+		hb, ok := data.Value.(uint64)
+		if !ok {
+			return
+		}
+		reportHeartbeat(s.heartbeatGauge, "metric", s.cfg.PushRing.Symbol, hb)
+	}
+
+	cycleTime := s.cfg.PushRing.SubscriptionCycleTime
+	if cycleTime == 0 {
+		cycleTime = 100 * time.Millisecond
+	}
+
+	sub, err := client.SubscribeValue(
+		s.core.cfg.PLCPort,
+		hbPath,
+		cb,
+		ads.SubscriptionSettings{
+			CycleTime:    cycleTime,
+			SendOnChange: true,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("SubscribeValue(%q): %w", hbPath, err)
+	}
+
+	s.pushRingMu.Lock()
+	s.heartbeatSub = sub
 	s.pushRingMu.Unlock()
 	return nil
 }
@@ -492,6 +564,10 @@ func (s *metricsSignal) reconnect(client *ads.Client) error {
 			_ = client.Unsubscribe(s.pushSub)
 			s.pushSub = nil
 		}
+		if s.heartbeatSub != nil {
+			_ = client.Unsubscribe(s.heartbeatSub)
+			s.heartbeatSub = nil
+		}
 		s.pushRingMu.Unlock()
 
 		atomic.StoreUint32(&s.pushLocalRI, 0)
@@ -501,6 +577,11 @@ func (s *metricsSignal) reconnect(client *ads.Client) error {
 		}
 		if err := s.subscribePushRing(client); err != nil {
 			return fmt.Errorf("push ring re-subscribe: %w", err)
+		}
+		if s.cfg.PushRing.Heartbeat {
+			if err := s.subscribeHeartbeat(client); err != nil {
+				return fmt.Errorf("heartbeat re-subscribe: %w", err)
+			}
 		}
 	}
 
