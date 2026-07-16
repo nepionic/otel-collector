@@ -136,11 +136,17 @@ func (s *logsSignal) trySubscribe() (netErr error, done bool) {
 }
 
 // teardown unsubscribes and stops the TwinCAT logger subscription. Safe to
-// call even if subscribe never succeeded.
+// call even if subscribe never succeeded, or Start() never got far enough to
+// create core.client at all (e.g. a sibling component failing to start
+// during the same collector startup, aborting before adsCore.Start ran).
 func (s *logsSignal) teardown() {
 	if s.loggerCancel != nil {
 		s.loggerCancel()
 		s.loggerWg.Wait()
+	}
+
+	if s.core.client == nil {
+		return
 	}
 
 	s.wmu.Lock()

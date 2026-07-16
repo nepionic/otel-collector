@@ -129,8 +129,13 @@ func (s *metricsSignal) trySubscribe() (netErr error, done bool) {
 }
 
 // teardown unsubscribes pull and push subscriptions. Safe to call even if
-// subscribe never succeeded.
+// subscribe never succeeded, or Start() never got far enough to create
+// core.client at all (e.g. a sibling component failing to start during the
+// same collector startup, aborting before adsCore.Start ran).
 func (s *metricsSignal) teardown() {
+	if s.core.client == nil {
+		return
+	}
 	client := s.core.client.Client()
 
 	s.pullMu.Lock()
