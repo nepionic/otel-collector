@@ -38,11 +38,21 @@ type logsSignal struct {
 	subscription *ads.ActiveSubscription
 	wmu          sync.Mutex // guards subscription and ring address fields
 
+	// heartbeatSub is a dedicated subscription directly on <symbol>.heartbeat
+	// (not gated by .head), so heartbeat reporting doesn't depend on how
+	// often unrelated log ring traffic happens to drain. nil unless
+	// PushRing.Heartbeat is enabled. Guarded by wmu.
+	heartbeatSub *ads.ActiveSubscription
+
 	wiCh chan uint32 // write_index notifications feed this channel
 
 	// ringOverflowCounter is the self-telemetry counter for ring buffer
 	// overflows (see telemetry.go). May be nil if instrument creation failed.
 	ringOverflowCounter metric.Int64Counter
+
+	// heartbeatGauge is the self-telemetry gauge for the PLC-reported
+	// heartbeat (see telemetry.go). May be nil if instrument creation failed.
+	heartbeatGauge metric.Float64Gauge
 
 	// TwinCAT system logger (port 100) subscription.
 	loggerCancel context.CancelFunc
@@ -56,6 +66,11 @@ func newLogsSignal(cfg *LogsConfig, core *adsCore, set receiver.Settings, next c
 		logger.Warn("Failed to create ring overflow self-telemetry counter", zap.Error(err))
 		counter = nil
 	}
+	gauge, err := newHeartbeatGauge(set.TelemetrySettings.MeterProvider)
+	if err != nil {
+		logger.Warn("Failed to create heartbeat self-telemetry gauge", zap.Error(err))
+		gauge = nil
+	}
 	return &logsSignal{
 		cfg:                 cfg,
 		core:                core,
@@ -64,6 +79,7 @@ func newLogsSignal(cfg *LogsConfig, core *adsCore, set receiver.Settings, next c
 		logger:              logger,
 		wiCh:                make(chan uint32, 64),
 		ringOverflowCounter: counter,
+		heartbeatGauge:      gauge,
 	}
 }
 
@@ -125,6 +141,17 @@ func (s *logsSignal) trySubscribe() (netErr error, done bool) {
 		return nil, false
 	}
 
+	if s.cfg.PushRing.Heartbeat {
+		if err := s.subscribeHeartbeat(client, plcPort); err != nil {
+			if adsbridge.IsNetworkError(err) {
+				s.logger.Warn("TCP connection dropped during heartbeat subscribe", zap.String("symbol", s.cfg.PushRing.Symbol), zap.Error(err))
+				return err, false
+			}
+			s.logger.Warn("Heartbeat subscribe failed; retrying", zap.String("symbol", s.cfg.PushRing.Symbol), zap.Error(err))
+			return nil, false
+		}
+	}
+
 	s.logger.Info("ADS logs signal subscribed",
 		zap.String("target_net_id", s.core.cfg.TargetNetID),
 		zap.String("symbol", s.cfg.PushRing.Symbol),
@@ -151,9 +178,13 @@ func (s *logsSignal) teardown() {
 
 	s.wmu.Lock()
 	sub := s.subscription
+	hbSub := s.heartbeatSub
 	s.wmu.Unlock()
 	if sub != nil {
 		_ = s.core.client.Client().Unsubscribe(sub)
+	}
+	if hbSub != nil {
+		_ = s.core.client.Client().Unsubscribe(hbSub)
 	}
 }
 
@@ -210,6 +241,49 @@ func (s *logsSignal) subscribe(client *ads.Client, plcPort uint16) error {
 	return nil
 }
 
+// subscribeHeartbeat sets up a dedicated ADS subscription directly on
+// <symbol>.heartbeat - deliberately independent of the .head subscription
+// above. Piggybacking heartbeat detection on the head-driven drain would tie
+// its freshness to how often the log ring actually drains, which can be
+// arbitrarily rare (it only drains when a log entry is actually appended).
+// Subscribing to the heartbeat value directly means the ADS notification
+// itself delivers the new value - no ring re-read needed - on its own
+// cadence, matching whatever rate the PLC calls Heartbeat() at.
+func (s *logsSignal) subscribeHeartbeat(client *ads.Client, plcPort uint16) error {
+	hbPath := s.cfg.PushRing.Symbol + ".heartbeat"
+
+	cb := func(data ads.SubscriptionData) {
+		hb, ok := data.Value.(uint64)
+		if !ok {
+			return
+		}
+		reportHeartbeat(s.heartbeatGauge, "log", s.cfg.PushRing.Symbol, hb)
+	}
+
+	cycleTime := s.cfg.PushRing.SubscriptionCycleTime
+	if cycleTime == 0 {
+		cycleTime = 100 * time.Millisecond
+	}
+
+	sub, err := client.SubscribeValue(
+		plcPort,
+		hbPath,
+		cb,
+		ads.SubscriptionSettings{
+			CycleTime:    cycleTime,
+			SendOnChange: true,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("SubscribeValue(%q): %w", hbPath, err)
+	}
+
+	s.wmu.Lock()
+	s.heartbeatSub = sub
+	s.wmu.Unlock()
+	return nil
+}
+
 // reconnect is called by adsCore.reconnect after TwinCAT returns to Run state.
 func (s *logsSignal) reconnect(client *ads.Client) error {
 	if s.cfg.PushRing.Enabled {
@@ -228,6 +302,10 @@ func (s *logsSignal) reconnect(client *ads.Client) error {
 			_ = client.Unsubscribe(s.subscription)
 			s.subscription = nil
 		}
+		if s.heartbeatSub != nil {
+			_ = client.Unsubscribe(s.heartbeatSub)
+			s.heartbeatSub = nil
+		}
 		s.wmu.Unlock()
 
 		// Reset read cursor so we don't try to replay stale slots.
@@ -235,6 +313,11 @@ func (s *logsSignal) reconnect(client *ads.Client) error {
 
 		if err := s.subscribe(client, plcPort); err != nil {
 			return err
+		}
+		if s.cfg.PushRing.Heartbeat {
+			if err := s.subscribeHeartbeat(client, plcPort); err != nil {
+				return err
+			}
 		}
 	}
 

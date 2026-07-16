@@ -42,3 +42,32 @@ func reportRingOverflow(logger *zap.Logger, counter metric.Int64Counter, ringTyp
 		)
 	}
 }
+
+const heartbeatMetricName = "otelcol_ads.plc.heartbeat_epoch_s"
+
+// newHeartbeatGauge creates the shared self-telemetry gauge instrument used by
+// both signals to report the PLC's self-reported clock. Called once per
+// signal at construction time from its own MeterProvider.
+func newHeartbeatGauge(mp metric.MeterProvider) (metric.Float64Gauge, error) {
+	meter := mp.Meter("github.com/nepionic/otelcol-ads/receiver/adsreceiver")
+	return meter.Float64Gauge(heartbeatMetricName,
+		metric.WithDescription("PLC-reported Unix epoch seconds, refreshed by the PLC's own Heartbeat() call - liveness and clock-skew signal for the collector's ADS/PLC connection, not PLC business data."),
+		metric.WithUnit("s"),
+	)
+}
+
+// reportHeartbeat is the single place both signals report a fresh heartbeat
+// reading. Self-telemetry only, mirroring reportRingOverflow: this describes
+// whether the collector is still hearing from a live PLC task, which is
+// operational health of the collection mechanism, not PLC business data.
+// ringType is "log" or "metric". gauge may be nil (instrument creation
+// failed). heartbeatNs of 0 means the PLC has never called Heartbeat() on
+// this ring, so nothing is reported yet.
+func reportHeartbeat(gauge metric.Float64Gauge, ringType, symbol string, heartbeatNs uint64) {
+	if gauge == nil || heartbeatNs == 0 {
+		return
+	}
+	gauge.Record(context.Background(), float64(heartbeatNs)/1e9,
+		metric.WithAttributes(attribute.String("ring", ringType), attribute.String("symbol", symbol)),
+	)
+}

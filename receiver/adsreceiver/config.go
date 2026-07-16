@@ -101,6 +101,13 @@ type LogRingConfig struct {
 	// the ring faster than the collector drains them, causing data loss.
 	// Default: true.
 	RingOverflows bool `mapstructure:"ring_overflows"`
+
+	// Heartbeat reports a otelcol_ads.plc.heartbeat_epoch_s self-telemetry
+	// gauge from the ring header's heartbeat field, whenever the PLC has ever
+	// called its OTelLogAppender's Heartbeat() method (default: false -
+	// opt-in, since the PLC side must also actively populate the field for
+	// this to mean anything).
+	Heartbeat bool `mapstructure:"heartbeat"`
 }
 
 // MetricType mirrors the ADS flags field in ST_OtelMetricSlot and the
@@ -164,6 +171,13 @@ type PushRingConfig struct {
 	// SubscriptionCycleTime is the ADS notification cycle time for write_index
 	// (default: 100ms).
 	SubscriptionCycleTime time.Duration `mapstructure:"subscription_cycle_time"`
+
+	// Heartbeat emits a otelcol_ads.plc.heartbeat_epoch_s gauge metric from the
+	// ring header's heartbeat field, whenever the PLC has ever called its
+	// OTelMetricCore's Heartbeat() method (default: false - opt-in, since the
+	// PLC side must also actively populate the field for this to mean
+	// anything).
+	Heartbeat bool `mapstructure:"heartbeat"`
 }
 
 var (

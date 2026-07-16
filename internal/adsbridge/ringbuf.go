@@ -71,6 +71,14 @@ type RingHeader struct {
 }
 
 // ParseMetricRingHeader parses the 64-byte header from a raw buffer read.
+//
+// The header also has a heartbeat field (offset 16, ULINT) but it is not
+// parsed here - heartbeat is read via its own dedicated ADS subscription
+// (see subscribeHeartbeat in logs.go/metrics.go), not by re-reading the ring
+// on every head-triggered drain, since drain frequency for a given ring
+// depends entirely on unrelated traffic on that ring (e.g. the log ring only
+// drains when a log entry is actually appended, which can be arbitrarily
+// rare) and heartbeat needs to be observed on its own cadence regardless.
 func ParseMetricRingHeader(b []byte) (RingHeader, error) {
 	if len(b) < MetricHeaderSize {
 		return RingHeader{}, fmt.Errorf("metric ring header: need %d bytes, got %d", MetricHeaderSize, len(b))
