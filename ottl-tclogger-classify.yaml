@@ -1,0 +1,212 @@
+# Classifies TwinCAT System Logger (ADS port 100) entries into known message
+# patterns, extracting structured attributes from each and marking whether it
+# recognised the message at all.
+#
+# adsreceiver's logsSignal emits one real log record per TwinCAT system
+# logger entry (event.name: ads.twincat.logger, body: the raw message text
+# from the PLC/TwinCAT runtime) - see emitTCLogEntry in
+# receiver/adsreceiver/logs.go. That body is free-text maintained by
+# Beckhoff (and by whatever field devices/safety controllers/NC axes are
+# attached), not otelcol-ads, so there's no fixed schema to parse against -
+# only a growing set of message shapes observed in the wild.
+#
+# Every log_statements group below is applied only to that event
+# (event.name == "ads.twincat.logger"). It:
+#   1. Sets tclogger_matched = false as a default.
+#   2. Tries each known pattern in turn. On a match it extracts named
+#      capture groups into attributes and overwrites tclogger_matched = true
+#      plus tclogger_pattern (which specific message shape) and
+#      tclogger_category (the functional area it belongs to - licensing,
+#      lifecycle, configuration, safety, motion, faults, diagnostics, ...).
+#
+# Patterns are grouped by tclogger_category purely for readability/upkeep -
+# add new categories freely as new kinds of messages turn up (e.g. a
+# distinct "network"/"io" boundary once you have real samples for it).
+#
+# Messages that don't match anything keep tclogger_matched = false and no
+# tclogger_pattern/tclogger_category, so they're easy to find and turn into
+# a new pattern:
+#
+#   {service_name="<your otelcol-ads service.name>"}
+#     | tclogger_matched = `false`
+#
+# To add a pattern once you've found a new message shape: pick a short
+# snake_case id and a category, write a regex against the raw body with
+# named capture groups for whatever fields are worth extracting (Go RE2
+# syntax - (?P<name>...), name must be alnum/underscore only), and append a
+# 3-statement block following the existing ones in the right category
+# section (or start a new section). If the message carries no extractable
+# fields (e.g. a fixed string), skip the merge_maps line and just set
+# tclogger_pattern/tclogger_category/tclogger_matched - see no_license below.
+#
+# Statement lines are single-quoted (rather than left as bare YAML plain
+# scalars) because several of these regexes contain ": " (colon-space) -
+# e.g. "AdsState: " - which YAML's plain scalar form misreads as a mapping
+# key/value separator. Single-quoting sidesteps that; it also means
+# backslashes pass through to OTTL untouched, so regex escapes like \\d stay
+# exactly as written. Any literal single quote inside a statement (there are
+# plenty here - TwinCAT quotes source/axis/drive names with '...') must be
+# doubled ('') per YAML's single-quote escaping rule.
+#
+# Prerequisite: transformprocessor is a contrib-only component - see
+# ottl-ads-go-normalisation.yaml's header for the ocb module line if you're
+# not already running a stock opentelemetry-collector-contrib image.
+
+processors:
+  transform/classify_tclogger:
+    log_statements:
+      - context: log
+        conditions:
+          - attributes["event.name"] == "ads.twincat.logger"
+        statements:
+          - 'set(attributes["tclogger_matched"], false)'
+
+          # ---- licensing ----
+          # license validation status is Valid(3)
+          - 'merge_maps(attributes, ExtractPatterns(body, "^license validation status is (?P<tclogger_license_status>\\w+)\\((?P<tclogger_license_code>\\d+)\\)$"), "insert") where IsMatch(body, "^license validation status is (?P<tclogger_license_status>\\w+)\\((?P<tclogger_license_code>\\d+)\\)$")'
+          - 'set(attributes["tclogger_pattern"], "license_status") where IsMatch(body, "^license validation status is (?P<tclogger_license_status>\\w+)\\((?P<tclogger_license_code>\\d+)\\)$")'
+          - 'set(attributes["tclogger_category"], "licensing") where IsMatch(body, "^license validation status is (?P<tclogger_license_status>\\w+)\\((?P<tclogger_license_code>\\d+)\\)$")'
+          - 'set(attributes["tclogger_matched"], true) where IsMatch(body, "^license validation status is (?P<tclogger_license_status>\\w+)\\((?P<tclogger_license_code>\\d+)\\)$")'
+
+          # No license found!
+          - 'set(attributes["tclogger_pattern"], "no_license") where body == "No license found!"'
+          - 'set(attributes["tclogger_category"], "licensing") where body == "No license found!"'
+          - 'set(attributes["tclogger_matched"], true) where body == "No license found!"'
+
+
+          # ---- lifecycle ----
+          # Shutting down TwinCAT Server TcMcGst.exe.
+          # Initializing TwinCAT Server TcpIpServer.exe.
+          # Starting TwinCAT Server TcMcGst.exe.
+          - 'merge_maps(attributes, ExtractPatterns(body, "^(?P<tclogger_action>Shutting down|Initializing|Starting) TwinCAT Server (?P<tclogger_server>.+)\\.$"), "insert") where IsMatch(body, "^(?P<tclogger_action>Shutting down|Initializing|Starting) TwinCAT Server (?P<tclogger_server>.+)\\.$")'
+          - 'set(attributes["tclogger_pattern"], "server_lifecycle") where IsMatch(body, "^(?P<tclogger_action>Shutting down|Initializing|Starting) TwinCAT Server (?P<tclogger_server>.+)\\.$")'
+          - 'set(attributes["tclogger_category"], "lifecycle") where IsMatch(body, "^(?P<tclogger_action>Shutting down|Initializing|Starting) TwinCAT Server (?P<tclogger_server>.+)\\.$")'
+          - 'set(attributes["tclogger_matched"], true) where IsMatch(body, "^(?P<tclogger_action>Shutting down|Initializing|Starting) TwinCAT Server (?P<tclogger_server>.+)\\.$")'
+
+          # TwinCAT System Start: AdsState: 15 NumProc: 12
+          - 'merge_maps(attributes, ExtractPatterns(body, "^TwinCAT System Start: AdsState: (?P<tclogger_ads_state>\\d+) NumProc: (?P<tclogger_num_proc>\\d+)$"), "insert") where IsMatch(body, "^TwinCAT System Start: AdsState: (?P<tclogger_ads_state>\\d+) NumProc: (?P<tclogger_num_proc>\\d+)$")'
+          - 'set(attributes["tclogger_pattern"], "system_start") where IsMatch(body, "^TwinCAT System Start: AdsState: (?P<tclogger_ads_state>\\d+) NumProc: (?P<tclogger_num_proc>\\d+)$")'
+          - 'set(attributes["tclogger_category"], "lifecycle") where IsMatch(body, "^TwinCAT System Start: AdsState: (?P<tclogger_ads_state>\\d+) NumProc: (?P<tclogger_num_proc>\\d+)$")'
+          - 'set(attributes["tclogger_matched"], true) where IsMatch(body, "^TwinCAT System Start: AdsState: (?P<tclogger_ads_state>\\d+) NumProc: (?P<tclogger_num_proc>\\d+)$")'
+
+          # TwinCAT system start completed. AdsState: >15<
+          - 'merge_maps(attributes, ExtractPatterns(body, "^TwinCAT system start completed\\. AdsState: >(?P<tclogger_ads_state>\\d+)<$"), "insert") where IsMatch(body, "^TwinCAT system start completed\\. AdsState: >(?P<tclogger_ads_state>\\d+)<$")'
+          - 'set(attributes["tclogger_pattern"], "system_start_completed") where IsMatch(body, "^TwinCAT system start completed\\. AdsState: >(?P<tclogger_ads_state>\\d+)<$")'
+          - 'set(attributes["tclogger_category"], "lifecycle") where IsMatch(body, "^TwinCAT system start completed\\. AdsState: >(?P<tclogger_ads_state>\\d+)<$")'
+          - 'set(attributes["tclogger_matched"], true) where IsMatch(body, "^TwinCAT system start completed\\. AdsState: >(?P<tclogger_ads_state>\\d+)<$")'
+
+
+          # ---- configuration ----
+          # Activate configuration performed from 'BOSON' (10.10.20.159.1.1) by 'IND\malleblas'
+          - 'merge_maps(attributes, ExtractPatterns(body, "^Activate configuration performed from ''(?P<tclogger_source_host>[^'']+)'' \\((?P<tclogger_source_net_id>[^)]+)\\) by ''(?P<tclogger_user>[^'']+)''$"), "insert") where IsMatch(body, "^Activate configuration performed from ''(?P<tclogger_source_host>[^'']+)'' \\((?P<tclogger_source_net_id>[^)]+)\\) by ''(?P<tclogger_user>[^'']+)''$")'
+          - 'set(attributes["tclogger_pattern"], "activate_configuration") where IsMatch(body, "^Activate configuration performed from ''(?P<tclogger_source_host>[^'']+)'' \\((?P<tclogger_source_net_id>[^)]+)\\) by ''(?P<tclogger_user>[^'']+)''$")'
+          - 'set(attributes["tclogger_category"], "configuration") where IsMatch(body, "^Activate configuration performed from ''(?P<tclogger_source_host>[^'']+)'' \\((?P<tclogger_source_net_id>[^)]+)\\) by ''(?P<tclogger_user>[^'']+)''$")'
+          - 'set(attributes["tclogger_matched"], true) where IsMatch(body, "^Activate configuration performed from ''(?P<tclogger_source_host>[^'']+)'' \\((?P<tclogger_source_net_id>[^)]+)\\) by ''(?P<tclogger_user>[^'']+)''$")'
+
+
+          # ---- safety ----
+          # 'Safety Controller (EL6910)': (0x3400) The 1. group has no more errors
+          - 'merge_maps(attributes, ExtractPatterns(body, "^''(?P<tclogger_source>Safety Controller \\([^)]+\\))'': \\(0x(?P<tclogger_code>[0-9A-Fa-f]+)\\) The (?P<tclogger_group>\\d+)\\. group has no more errors$"), "insert") where IsMatch(body, "^''(?P<tclogger_source>Safety Controller \\([^)]+\\))'': \\(0x(?P<tclogger_code>[0-9A-Fa-f]+)\\) The (?P<tclogger_group>\\d+)\\. group has no more errors$")'
+          - 'set(attributes["tclogger_pattern"], "safety_group_no_errors") where IsMatch(body, "^''(?P<tclogger_source>Safety Controller \\([^)]+\\))'': \\(0x(?P<tclogger_code>[0-9A-Fa-f]+)\\) The (?P<tclogger_group>\\d+)\\. group has no more errors$")'
+          - 'set(attributes["tclogger_category"], "safety") where IsMatch(body, "^''(?P<tclogger_source>Safety Controller \\([^)]+\\))'': \\(0x(?P<tclogger_code>[0-9A-Fa-f]+)\\) The (?P<tclogger_group>\\d+)\\. group has no more errors$")'
+          - 'set(attributes["tclogger_matched"], true) where IsMatch(body, "^''(?P<tclogger_source>Safety Controller \\([^)]+\\))'': \\(0x(?P<tclogger_code>[0-9A-Fa-f]+)\\) The (?P<tclogger_group>\\d+)\\. group has no more errors$")'
+
+          # 'Safety Controller (EL6910)': (0x2085) The FSoE-Watchdog of the 9. connection has been expired in state DATA
+          - 'merge_maps(attributes, ExtractPatterns(body, "^''(?P<tclogger_source>Safety Controller \\([^)]+\\))'': \\(0x(?P<tclogger_code>[0-9A-Fa-f]+)\\) The FSoE-Watchdog of the (?P<tclogger_connection>\\d+)\\. connection has been expired in state (?P<tclogger_state>\\w+)$"), "insert") where IsMatch(body, "^''(?P<tclogger_source>Safety Controller \\([^)]+\\))'': \\(0x(?P<tclogger_code>[0-9A-Fa-f]+)\\) The FSoE-Watchdog of the (?P<tclogger_connection>\\d+)\\. connection has been expired in state (?P<tclogger_state>\\w+)$")'
+          - 'set(attributes["tclogger_pattern"], "safety_fsoe_watchdog_expired") where IsMatch(body, "^''(?P<tclogger_source>Safety Controller \\([^)]+\\))'': \\(0x(?P<tclogger_code>[0-9A-Fa-f]+)\\) The FSoE-Watchdog of the (?P<tclogger_connection>\\d+)\\. connection has been expired in state (?P<tclogger_state>\\w+)$")'
+          - 'set(attributes["tclogger_category"], "safety") where IsMatch(body, "^''(?P<tclogger_source>Safety Controller \\([^)]+\\))'': \\(0x(?P<tclogger_code>[0-9A-Fa-f]+)\\) The FSoE-Watchdog of the (?P<tclogger_connection>\\d+)\\. connection has been expired in state (?P<tclogger_state>\\w+)$")'
+          - 'set(attributes["tclogger_matched"], true) where IsMatch(body, "^''(?P<tclogger_source>Safety Controller \\([^)]+\\))'': \\(0x(?P<tclogger_code>[0-9A-Fa-f]+)\\) The FSoE-Watchdog of the (?P<tclogger_connection>\\d+)\\. connection has been expired in state (?P<tclogger_state>\\w+)$")'
+
+          # 'Feed Drive (AX5140-0000-0215) (Chn A)': 0x FDD3, Safety switch off while the axis was enabled.
+          - 'merge_maps(attributes, ExtractPatterns(body, "^''(?P<tclogger_drive>[^'']+)'': 0x (?P<tclogger_code>[0-9A-Fa-f]+), Safety switch off while the axis was enabled\\.$"), "insert") where IsMatch(body, "^''(?P<tclogger_drive>[^'']+)'': 0x (?P<tclogger_code>[0-9A-Fa-f]+), Safety switch off while the axis was enabled\\.$")'
+          - 'set(attributes["tclogger_pattern"], "drive_safety_switch_off") where IsMatch(body, "^''(?P<tclogger_drive>[^'']+)'': 0x (?P<tclogger_code>[0-9A-Fa-f]+), Safety switch off while the axis was enabled\\.$")'
+          - 'set(attributes["tclogger_category"], "safety") where IsMatch(body, "^''(?P<tclogger_drive>[^'']+)'': 0x (?P<tclogger_code>[0-9A-Fa-f]+), Safety switch off while the axis was enabled\\.$")'
+          - 'set(attributes["tclogger_matched"], true) where IsMatch(body, "^''(?P<tclogger_drive>[^'']+)'': 0x (?P<tclogger_code>[0-9A-Fa-f]+), Safety switch off while the axis was enabled\\.$")'
+
+          # 'Feed Drive (AX5140-0000-0215) (Chn A)': 0x FDD9, Safety card: safety card activated - internal reaction
+          - 'merge_maps(attributes, ExtractPatterns(body, "^''(?P<tclogger_drive>[^'']+)'': 0x (?P<tclogger_code>[0-9A-Fa-f]+), Safety card: safety card activated - internal reaction$"), "insert") where IsMatch(body, "^''(?P<tclogger_drive>[^'']+)'': 0x (?P<tclogger_code>[0-9A-Fa-f]+), Safety card: safety card activated - internal reaction$")'
+          - 'set(attributes["tclogger_pattern"], "drive_safety_card_activated") where IsMatch(body, "^''(?P<tclogger_drive>[^'']+)'': 0x (?P<tclogger_code>[0-9A-Fa-f]+), Safety card: safety card activated - internal reaction$")'
+          - 'set(attributes["tclogger_category"], "safety") where IsMatch(body, "^''(?P<tclogger_drive>[^'']+)'': 0x (?P<tclogger_code>[0-9A-Fa-f]+), Safety card: safety card activated - internal reaction$")'
+          - 'set(attributes["tclogger_matched"], true) where IsMatch(body, "^''(?P<tclogger_drive>[^'']+)'': 0x (?P<tclogger_code>[0-9A-Fa-f]+), Safety card: safety card activated - internal reaction$")'
+
+
+          # ---- motion ----
+          # 'Term 8 (EL5042)': (0x830B) Encoder Watchdog Error, channel: {0,X}
+          - 'merge_maps(attributes, ExtractPatterns(body, "^''(?P<tclogger_terminal>[^'']+)'': \\(0x(?P<tclogger_code>[0-9A-Fa-f]+)\\) Encoder Watchdog Error, channel: \\{(?P<tclogger_channel>[^}]+)\\}$"), "insert") where IsMatch(body, "^''(?P<tclogger_terminal>[^'']+)'': \\(0x(?P<tclogger_code>[0-9A-Fa-f]+)\\) Encoder Watchdog Error, channel: \\{(?P<tclogger_channel>[^}]+)\\}$")'
+          - 'set(attributes["tclogger_pattern"], "encoder_watchdog_error") where IsMatch(body, "^''(?P<tclogger_terminal>[^'']+)'': \\(0x(?P<tclogger_code>[0-9A-Fa-f]+)\\) Encoder Watchdog Error, channel: \\{(?P<tclogger_channel>[^}]+)\\}$")'
+          - 'set(attributes["tclogger_category"], "motion") where IsMatch(body, "^''(?P<tclogger_terminal>[^'']+)'': \\(0x(?P<tclogger_code>[0-9A-Fa-f]+)\\) Encoder Watchdog Error, channel: \\{(?P<tclogger_channel>[^}]+)\\}$")'
+          - 'set(attributes["tclogger_matched"], true) where IsMatch(body, "^''(?P<tclogger_terminal>[^'']+)'': \\(0x(?P<tclogger_code>[0-9A-Fa-f]+)\\) Encoder Watchdog Error, channel: \\{(?P<tclogger_channel>[^}]+)\\}$")'
+
+          # 'Medium Arm Clamp Radius Drive (AX5118-0000-0215) (Chn A)': 0x F415, Distributed clocks: Process data synchronization lost
+          - 'merge_maps(attributes, ExtractPatterns(body, "^''(?P<tclogger_drive>[^'']+)'': 0x (?P<tclogger_code>[0-9A-Fa-f]+), Distributed clocks: Process data synchronization lost$"), "insert") where IsMatch(body, "^''(?P<tclogger_drive>[^'']+)'': 0x (?P<tclogger_code>[0-9A-Fa-f]+), Distributed clocks: Process data synchronization lost$")'
+          - 'set(attributes["tclogger_pattern"], "distributed_clocks_sync_lost") where IsMatch(body, "^''(?P<tclogger_drive>[^'']+)'': 0x (?P<tclogger_code>[0-9A-Fa-f]+), Distributed clocks: Process data synchronization lost$")'
+          - 'set(attributes["tclogger_category"], "motion") where IsMatch(body, "^''(?P<tclogger_drive>[^'']+)'': 0x (?P<tclogger_code>[0-9A-Fa-f]+), Distributed clocks: Process data synchronization lost$")'
+          - 'set(attributes["tclogger_matched"], true) where IsMatch(body, "^''(?P<tclogger_drive>[^'']+)'': 0x (?P<tclogger_code>[0-9A-Fa-f]+), Distributed clocks: Process data synchronization lost$")'
+
+          # 'TCNC' (500): 'Inductor Forward-Backwards' (Axis-ID: 3, Drive-ID: 3): The hardware drive device has a C1D error like 'F2xx' (error: 0x4650, Status1+2=0xe0, Ctrl1=0x60, SetVelo=0.000000, PosDiff=-0.000000)
+          - 'merge_maps(attributes, ExtractPatterns(body, "^''TCNC'' \\((?P<tclogger_tcnc_id>\\d+)\\): ''(?P<tclogger_axis>[^'']+)'' \\(Axis-ID: (?P<tclogger_axis_id>\\d+), Drive-ID: (?P<tclogger_drive_id>\\d+)\\): The hardware drive device has a C1D error like ''(?P<tclogger_fault>[^'']+)'' \\(error: 0x(?P<tclogger_error_code>[0-9A-Fa-f]+), Status1\\+2=0x(?P<tclogger_status12>[0-9A-Fa-f]+), Ctrl1=0x(?P<tclogger_ctrl1>[0-9A-Fa-f]+), SetVelo=(?P<tclogger_set_velo>-?\\d+\\.\\d+), PosDiff=(?P<tclogger_pos_diff>-?\\d+\\.\\d+)\\)$"), "insert") where IsMatch(body, "^''TCNC'' \\((?P<tclogger_tcnc_id>\\d+)\\): ''(?P<tclogger_axis>[^'']+)'' \\(Axis-ID: (?P<tclogger_axis_id>\\d+), Drive-ID: (?P<tclogger_drive_id>\\d+)\\): The hardware drive device has a C1D error like ''(?P<tclogger_fault>[^'']+)'' \\(error: 0x(?P<tclogger_error_code>[0-9A-Fa-f]+), Status1\\+2=0x(?P<tclogger_status12>[0-9A-Fa-f]+), Ctrl1=0x(?P<tclogger_ctrl1>[0-9A-Fa-f]+), SetVelo=(?P<tclogger_set_velo>-?\\d+\\.\\d+), PosDiff=(?P<tclogger_pos_diff>-?\\d+\\.\\d+)\\)$")'
+          - 'set(attributes["tclogger_pattern"], "drive_c1d_error") where IsMatch(body, "^''TCNC'' \\((?P<tclogger_tcnc_id>\\d+)\\): ''(?P<tclogger_axis>[^'']+)'' \\(Axis-ID: (?P<tclogger_axis_id>\\d+), Drive-ID: (?P<tclogger_drive_id>\\d+)\\): The hardware drive device has a C1D error like ''(?P<tclogger_fault>[^'']+)'' \\(error: 0x(?P<tclogger_error_code>[0-9A-Fa-f]+), Status1\\+2=0x(?P<tclogger_status12>[0-9A-Fa-f]+), Ctrl1=0x(?P<tclogger_ctrl1>[0-9A-Fa-f]+), SetVelo=(?P<tclogger_set_velo>-?\\d+\\.\\d+), PosDiff=(?P<tclogger_pos_diff>-?\\d+\\.\\d+)\\)$")'
+          - 'set(attributes["tclogger_category"], "motion") where IsMatch(body, "^''TCNC'' \\((?P<tclogger_tcnc_id>\\d+)\\): ''(?P<tclogger_axis>[^'']+)'' \\(Axis-ID: (?P<tclogger_axis_id>\\d+), Drive-ID: (?P<tclogger_drive_id>\\d+)\\): The hardware drive device has a C1D error like ''(?P<tclogger_fault>[^'']+)'' \\(error: 0x(?P<tclogger_error_code>[0-9A-Fa-f]+), Status1\\+2=0x(?P<tclogger_status12>[0-9A-Fa-f]+), Ctrl1=0x(?P<tclogger_ctrl1>[0-9A-Fa-f]+), SetVelo=(?P<tclogger_set_velo>-?\\d+\\.\\d+), PosDiff=(?P<tclogger_pos_diff>-?\\d+\\.\\d+)\\)$")'
+          - 'set(attributes["tclogger_matched"], true) where IsMatch(body, "^''TCNC'' \\((?P<tclogger_tcnc_id>\\d+)\\): ''(?P<tclogger_axis>[^'']+)'' \\(Axis-ID: (?P<tclogger_axis_id>\\d+), Drive-ID: (?P<tclogger_drive_id>\\d+)\\): The hardware drive device has a C1D error like ''(?P<tclogger_fault>[^'']+)'' \\(error: 0x(?P<tclogger_error_code>[0-9A-Fa-f]+), Status1\\+2=0x(?P<tclogger_status12>[0-9A-Fa-f]+), Ctrl1=0x(?P<tclogger_ctrl1>[0-9A-Fa-f]+), SetVelo=(?P<tclogger_set_velo>-?\\d+\\.\\d+), PosDiff=(?P<tclogger_pos_diff>-?\\d+\\.\\d+)\\)$")'
+
+          # 'TCNC' (500): 'Medium Arm Clamp Radius' (Axis-ID: 9, Drive-ID: 9): Axis detects for more than 3 consecutive nc cycles invalid IO data ('WcState' (SoE): encoder working counter error) (error-code: 0x4466) !
+          # 'TCNC' (500): 'Tugger' (Axis-ID: 6, Drive-ID: 6): Axis detects for more than 3 consecutive nc cycles invalid IO data ('WcState(CoE)': working counter error) (error-code: 0x4655) !
+          - 'merge_maps(attributes, ExtractPatterns(body, "^''TCNC'' \\((?P<tclogger_tcnc_id>\\d+)\\): ''(?P<tclogger_axis>[^'']+)'' \\(Axis-ID: (?P<tclogger_axis_id>\\d+), Drive-ID: (?P<tclogger_drive_id>\\d+)\\): Axis detects for more than (?P<tclogger_cycles>\\d+) consecutive nc cycles invalid IO data \\((?P<tclogger_io_detail>.+?)\\) \\(error-code: 0x(?P<tclogger_error_code>[0-9A-Fa-f]+)\\) !$"), "insert") where IsMatch(body, "^''TCNC'' \\((?P<tclogger_tcnc_id>\\d+)\\): ''(?P<tclogger_axis>[^'']+)'' \\(Axis-ID: (?P<tclogger_axis_id>\\d+), Drive-ID: (?P<tclogger_drive_id>\\d+)\\): Axis detects for more than (?P<tclogger_cycles>\\d+) consecutive nc cycles invalid IO data \\((?P<tclogger_io_detail>.+?)\\) \\(error-code: 0x(?P<tclogger_error_code>[0-9A-Fa-f]+)\\) !$")'
+          - 'set(attributes["tclogger_pattern"], "axis_invalid_io_data") where IsMatch(body, "^''TCNC'' \\((?P<tclogger_tcnc_id>\\d+)\\): ''(?P<tclogger_axis>[^'']+)'' \\(Axis-ID: (?P<tclogger_axis_id>\\d+), Drive-ID: (?P<tclogger_drive_id>\\d+)\\): Axis detects for more than (?P<tclogger_cycles>\\d+) consecutive nc cycles invalid IO data \\((?P<tclogger_io_detail>.+?)\\) \\(error-code: 0x(?P<tclogger_error_code>[0-9A-Fa-f]+)\\) !$")'
+          - 'set(attributes["tclogger_category"], "motion") where IsMatch(body, "^''TCNC'' \\((?P<tclogger_tcnc_id>\\d+)\\): ''(?P<tclogger_axis>[^'']+)'' \\(Axis-ID: (?P<tclogger_axis_id>\\d+), Drive-ID: (?P<tclogger_drive_id>\\d+)\\): Axis detects for more than (?P<tclogger_cycles>\\d+) consecutive nc cycles invalid IO data \\((?P<tclogger_io_detail>.+?)\\) \\(error-code: 0x(?P<tclogger_error_code>[0-9A-Fa-f]+)\\) !$")'
+          - 'set(attributes["tclogger_matched"], true) where IsMatch(body, "^''TCNC'' \\((?P<tclogger_tcnc_id>\\d+)\\): ''(?P<tclogger_axis>[^'']+)'' \\(Axis-ID: (?P<tclogger_axis_id>\\d+), Drive-ID: (?P<tclogger_drive_id>\\d+)\\): Axis detects for more than (?P<tclogger_cycles>\\d+) consecutive nc cycles invalid IO data \\((?P<tclogger_io_detail>.+?)\\) \\(error-code: 0x(?P<tclogger_error_code>[0-9A-Fa-f]+)\\) !$")'
+
+          # 'TCNC' (500): 'Machine Radius' (Axis-ID: 8, Drive-ID: 8): Unexpected state change from 'OperationEnabled' or 'SwitchedOn' to the DriveState 0x670 => DriveControl: 'ShutDown' (0x1f), (StatusByte4=0x2)
+          - 'merge_maps(attributes, ExtractPatterns(body, "^''TCNC'' \\((?P<tclogger_tcnc_id>\\d+)\\): ''(?P<tclogger_axis>[^'']+)'' \\(Axis-ID: (?P<tclogger_axis_id>\\d+), Drive-ID: (?P<tclogger_drive_id>\\d+)\\): Unexpected state change from ''(?P<tclogger_from_state>[^'']+)'' or ''(?P<tclogger_alt_from_state>[^'']+)'' to the DriveState 0x(?P<tclogger_drive_state>[0-9A-Fa-f]+) => DriveControl: ''(?P<tclogger_drive_control>[^'']+)'' \\(0x(?P<tclogger_drive_control_code>[0-9A-Fa-f]+)\\), \\(StatusByte(?P<tclogger_status_byte_num>\\d+)=0x(?P<tclogger_status_byte_val>[0-9A-Fa-f]+)\\)$"), "insert") where IsMatch(body, "^''TCNC'' \\((?P<tclogger_tcnc_id>\\d+)\\): ''(?P<tclogger_axis>[^'']+)'' \\(Axis-ID: (?P<tclogger_axis_id>\\d+), Drive-ID: (?P<tclogger_drive_id>\\d+)\\): Unexpected state change from ''(?P<tclogger_from_state>[^'']+)'' or ''(?P<tclogger_alt_from_state>[^'']+)'' to the DriveState 0x(?P<tclogger_drive_state>[0-9A-Fa-f]+) => DriveControl: ''(?P<tclogger_drive_control>[^'']+)'' \\(0x(?P<tclogger_drive_control_code>[0-9A-Fa-f]+)\\), \\(StatusByte(?P<tclogger_status_byte_num>\\d+)=0x(?P<tclogger_status_byte_val>[0-9A-Fa-f]+)\\)$")'
+          - 'set(attributes["tclogger_pattern"], "axis_drive_state_change") where IsMatch(body, "^''TCNC'' \\((?P<tclogger_tcnc_id>\\d+)\\): ''(?P<tclogger_axis>[^'']+)'' \\(Axis-ID: (?P<tclogger_axis_id>\\d+), Drive-ID: (?P<tclogger_drive_id>\\d+)\\): Unexpected state change from ''(?P<tclogger_from_state>[^'']+)'' or ''(?P<tclogger_alt_from_state>[^'']+)'' to the DriveState 0x(?P<tclogger_drive_state>[0-9A-Fa-f]+) => DriveControl: ''(?P<tclogger_drive_control>[^'']+)'' \\(0x(?P<tclogger_drive_control_code>[0-9A-Fa-f]+)\\), \\(StatusByte(?P<tclogger_status_byte_num>\\d+)=0x(?P<tclogger_status_byte_val>[0-9A-Fa-f]+)\\)$")'
+          - 'set(attributes["tclogger_category"], "motion") where IsMatch(body, "^''TCNC'' \\((?P<tclogger_tcnc_id>\\d+)\\): ''(?P<tclogger_axis>[^'']+)'' \\(Axis-ID: (?P<tclogger_axis_id>\\d+), Drive-ID: (?P<tclogger_drive_id>\\d+)\\): Unexpected state change from ''(?P<tclogger_from_state>[^'']+)'' or ''(?P<tclogger_alt_from_state>[^'']+)'' to the DriveState 0x(?P<tclogger_drive_state>[0-9A-Fa-f]+) => DriveControl: ''(?P<tclogger_drive_control>[^'']+)'' \\(0x(?P<tclogger_drive_control_code>[0-9A-Fa-f]+)\\), \\(StatusByte(?P<tclogger_status_byte_num>\\d+)=0x(?P<tclogger_status_byte_val>[0-9A-Fa-f]+)\\)$")'
+          - 'set(attributes["tclogger_matched"], true) where IsMatch(body, "^''TCNC'' \\((?P<tclogger_tcnc_id>\\d+)\\): ''(?P<tclogger_axis>[^'']+)'' \\(Axis-ID: (?P<tclogger_axis_id>\\d+), Drive-ID: (?P<tclogger_drive_id>\\d+)\\): Unexpected state change from ''(?P<tclogger_from_state>[^'']+)'' or ''(?P<tclogger_alt_from_state>[^'']+)'' to the DriveState 0x(?P<tclogger_drive_state>[0-9A-Fa-f]+) => DriveControl: ''(?P<tclogger_drive_control>[^'']+)'' \\(0x(?P<tclogger_drive_control_code>[0-9A-Fa-f]+)\\), \\(StatusByte(?P<tclogger_status_byte_num>\\d+)=0x(?P<tclogger_status_byte_val>[0-9A-Fa-f]+)\\)$")'
+
+          # 'Tugger (EK1101) (200) - Tugger drive (AKD) (1078)' Communication interrupted
+          - 'merge_maps(attributes, ExtractPatterns(body, "^''(?P<tclogger_slave>[^'']+)'' Communication interrupted$"), "insert") where IsMatch(body, "^''(?P<tclogger_slave>[^'']+)'' Communication interrupted$")'
+          - 'set(attributes["tclogger_pattern"], "fieldbus_communication_interrupted") where IsMatch(body, "^''(?P<tclogger_slave>[^'']+)'' Communication interrupted$")'
+          - 'set(attributes["tclogger_category"], "motion") where IsMatch(body, "^''(?P<tclogger_slave>[^'']+)'' Communication interrupted$")'
+          - 'set(attributes["tclogger_matched"], true) where IsMatch(body, "^''(?P<tclogger_slave>[^'']+)'' Communication interrupted$")'
+
+          # UASv (AxisID 2, CmdNo=13922, 0 (Aborting), CurPos=-0.1488, CurVelo=-0, CurAcc=0) StartPos=-0.1488; EndPos=-1e+15; Velo=25; Acc=56.712, Dec=56.712, Jerk=170.136, Error=0x4223
+          - 'merge_maps(attributes, ExtractPatterns(body, "^UASv \\(AxisID (?P<tclogger_axis_id>\\d+), CmdNo=(?P<tclogger_cmd_no>\\d+), (?P<tclogger_state_code>\\d+) \\((?P<tclogger_state_name>\\w+)\\), CurPos=(?P<tclogger_cur_pos>-?[\\d.]+(?:e[+-]?\\d+)?), CurVelo=(?P<tclogger_cur_velo>-?[\\d.]+(?:e[+-]?\\d+)?), CurAcc=(?P<tclogger_cur_acc>-?[\\d.]+(?:e[+-]?\\d+)?)\\) StartPos=(?P<tclogger_start_pos>-?[\\d.]+(?:e[+-]?\\d+)?); EndPos=(?P<tclogger_end_pos>-?[\\d.]+(?:e[+-]?\\d+)?); Velo=(?P<tclogger_velo>-?[\\d.]+(?:e[+-]?\\d+)?); Acc=(?P<tclogger_acc>-?[\\d.]+(?:e[+-]?\\d+)?), Dec=(?P<tclogger_dec>-?[\\d.]+(?:e[+-]?\\d+)?), Jerk=(?P<tclogger_jerk>-?[\\d.]+(?:e[+-]?\\d+)?), Error=0x(?P<tclogger_error_code>[0-9A-Fa-f]+)$"), "insert") where IsMatch(body, "^UASv \\(AxisID (?P<tclogger_axis_id>\\d+), CmdNo=(?P<tclogger_cmd_no>\\d+), (?P<tclogger_state_code>\\d+) \\((?P<tclogger_state_name>\\w+)\\), CurPos=(?P<tclogger_cur_pos>-?[\\d.]+(?:e[+-]?\\d+)?), CurVelo=(?P<tclogger_cur_velo>-?[\\d.]+(?:e[+-]?\\d+)?), CurAcc=(?P<tclogger_cur_acc>-?[\\d.]+(?:e[+-]?\\d+)?)\\) StartPos=(?P<tclogger_start_pos>-?[\\d.]+(?:e[+-]?\\d+)?); EndPos=(?P<tclogger_end_pos>-?[\\d.]+(?:e[+-]?\\d+)?); Velo=(?P<tclogger_velo>-?[\\d.]+(?:e[+-]?\\d+)?); Acc=(?P<tclogger_acc>-?[\\d.]+(?:e[+-]?\\d+)?), Dec=(?P<tclogger_dec>-?[\\d.]+(?:e[+-]?\\d+)?), Jerk=(?P<tclogger_jerk>-?[\\d.]+(?:e[+-]?\\d+)?), Error=0x(?P<tclogger_error_code>[0-9A-Fa-f]+)$")'
+          - 'set(attributes["tclogger_pattern"], "uasv_axis_status") where IsMatch(body, "^UASv \\(AxisID (?P<tclogger_axis_id>\\d+), CmdNo=(?P<tclogger_cmd_no>\\d+), (?P<tclogger_state_code>\\d+) \\((?P<tclogger_state_name>\\w+)\\), CurPos=(?P<tclogger_cur_pos>-?[\\d.]+(?:e[+-]?\\d+)?), CurVelo=(?P<tclogger_cur_velo>-?[\\d.]+(?:e[+-]?\\d+)?), CurAcc=(?P<tclogger_cur_acc>-?[\\d.]+(?:e[+-]?\\d+)?)\\) StartPos=(?P<tclogger_start_pos>-?[\\d.]+(?:e[+-]?\\d+)?); EndPos=(?P<tclogger_end_pos>-?[\\d.]+(?:e[+-]?\\d+)?); Velo=(?P<tclogger_velo>-?[\\d.]+(?:e[+-]?\\d+)?); Acc=(?P<tclogger_acc>-?[\\d.]+(?:e[+-]?\\d+)?), Dec=(?P<tclogger_dec>-?[\\d.]+(?:e[+-]?\\d+)?), Jerk=(?P<tclogger_jerk>-?[\\d.]+(?:e[+-]?\\d+)?), Error=0x(?P<tclogger_error_code>[0-9A-Fa-f]+)$")'
+          - 'set(attributes["tclogger_category"], "motion") where IsMatch(body, "^UASv \\(AxisID (?P<tclogger_axis_id>\\d+), CmdNo=(?P<tclogger_cmd_no>\\d+), (?P<tclogger_state_code>\\d+) \\((?P<tclogger_state_name>\\w+)\\), CurPos=(?P<tclogger_cur_pos>-?[\\d.]+(?:e[+-]?\\d+)?), CurVelo=(?P<tclogger_cur_velo>-?[\\d.]+(?:e[+-]?\\d+)?), CurAcc=(?P<tclogger_cur_acc>-?[\\d.]+(?:e[+-]?\\d+)?)\\) StartPos=(?P<tclogger_start_pos>-?[\\d.]+(?:e[+-]?\\d+)?); EndPos=(?P<tclogger_end_pos>-?[\\d.]+(?:e[+-]?\\d+)?); Velo=(?P<tclogger_velo>-?[\\d.]+(?:e[+-]?\\d+)?); Acc=(?P<tclogger_acc>-?[\\d.]+(?:e[+-]?\\d+)?), Dec=(?P<tclogger_dec>-?[\\d.]+(?:e[+-]?\\d+)?), Jerk=(?P<tclogger_jerk>-?[\\d.]+(?:e[+-]?\\d+)?), Error=0x(?P<tclogger_error_code>[0-9A-Fa-f]+)$")'
+          - 'set(attributes["tclogger_matched"], true) where IsMatch(body, "^UASv \\(AxisID (?P<tclogger_axis_id>\\d+), CmdNo=(?P<tclogger_cmd_no>\\d+), (?P<tclogger_state_code>\\d+) \\((?P<tclogger_state_name>\\w+)\\), CurPos=(?P<tclogger_cur_pos>-?[\\d.]+(?:e[+-]?\\d+)?), CurVelo=(?P<tclogger_cur_velo>-?[\\d.]+(?:e[+-]?\\d+)?), CurAcc=(?P<tclogger_cur_acc>-?[\\d.]+(?:e[+-]?\\d+)?)\\) StartPos=(?P<tclogger_start_pos>-?[\\d.]+(?:e[+-]?\\d+)?); EndPos=(?P<tclogger_end_pos>-?[\\d.]+(?:e[+-]?\\d+)?); Velo=(?P<tclogger_velo>-?[\\d.]+(?:e[+-]?\\d+)?); Acc=(?P<tclogger_acc>-?[\\d.]+(?:e[+-]?\\d+)?), Dec=(?P<tclogger_dec>-?[\\d.]+(?:e[+-]?\\d+)?), Jerk=(?P<tclogger_jerk>-?[\\d.]+(?:e[+-]?\\d+)?), Error=0x(?P<tclogger_error_code>[0-9A-Fa-f]+)$")'
+
+          # 'Feed' (Axis-ID: 2): The axis needs the "Feed Backward Permission" for backward positioning (error-code: 0x4357) !
+          # General shape: any axis error report ending in "(error-code: 0x....) !" - broader
+          # than the TCNC-prefixed axis_invalid_io_data pattern above (no 'TCNC' (nnn): prefix here).
+          - 'merge_maps(attributes, ExtractPatterns(body, "^''(?P<tclogger_axis>[^'']+)'' \\(Axis-ID: (?P<tclogger_axis_id>\\d+)\\): (?P<tclogger_detail>.+?) \\(error-code: 0x(?P<tclogger_error_code>[0-9A-Fa-f]+)\\) !$"), "insert") where IsMatch(body, "^''(?P<tclogger_axis>[^'']+)'' \\(Axis-ID: (?P<tclogger_axis_id>\\d+)\\): (?P<tclogger_detail>.+?) \\(error-code: 0x(?P<tclogger_error_code>[0-9A-Fa-f]+)\\) !$")'
+          - 'set(attributes["tclogger_pattern"], "axis_generic_error") where IsMatch(body, "^''(?P<tclogger_axis>[^'']+)'' \\(Axis-ID: (?P<tclogger_axis_id>\\d+)\\): (?P<tclogger_detail>.+?) \\(error-code: 0x(?P<tclogger_error_code>[0-9A-Fa-f]+)\\) !$")'
+          - 'set(attributes["tclogger_category"], "motion") where IsMatch(body, "^''(?P<tclogger_axis>[^'']+)'' \\(Axis-ID: (?P<tclogger_axis_id>\\d+)\\): (?P<tclogger_detail>.+?) \\(error-code: 0x(?P<tclogger_error_code>[0-9A-Fa-f]+)\\) !$")'
+          - 'set(attributes["tclogger_matched"], true) where IsMatch(body, "^''(?P<tclogger_axis>[^'']+)'' \\(Axis-ID: (?P<tclogger_axis_id>\\d+)\\): (?P<tclogger_detail>.+?) \\(error-code: 0x(?P<tclogger_error_code>[0-9A-Fa-f]+)\\) !$")'
+
+
+          # ---- faults ----
+          # Exception (Exception Code: 0xc000008e, FPU zero divide) in PLC Application Nepionic_OTel_IntegrationTest Instance, Task PlcTask (RBP: 0x737819fbc0, RIP: 0x250ba4e08c7, RSP: 0x737819fa90), Area 1, Offset 0x155c7
+          - 'merge_maps(attributes, ExtractPatterns(body, "^Exception \\(Exception Code: (?P<tclogger_exception_code>0x[0-9a-fA-F]+), (?P<tclogger_exception_reason>[^)]+)\\) in PLC Application (?P<tclogger_plc_application>\\S+) Instance, Task (?P<tclogger_task>\\S+) \\(RBP: (?P<tclogger_rbp>0x[0-9a-fA-F]+), RIP: (?P<tclogger_rip>0x[0-9a-fA-F]+), RSP: (?P<tclogger_rsp>0x[0-9a-fA-F]+)\\), Area (?P<tclogger_area>\\d+), Offset (?P<tclogger_offset>0x[0-9a-fA-F]+)$"), "insert") where IsMatch(body, "^Exception \\(Exception Code: (?P<tclogger_exception_code>0x[0-9a-fA-F]+), (?P<tclogger_exception_reason>[^)]+)\\) in PLC Application (?P<tclogger_plc_application>\\S+) Instance, Task (?P<tclogger_task>\\S+) \\(RBP: (?P<tclogger_rbp>0x[0-9a-fA-F]+), RIP: (?P<tclogger_rip>0x[0-9a-fA-F]+), RSP: (?P<tclogger_rsp>0x[0-9a-fA-F]+)\\), Area (?P<tclogger_area>\\d+), Offset (?P<tclogger_offset>0x[0-9a-fA-F]+)$")'
+          - 'set(attributes["tclogger_pattern"], "plc_exception") where IsMatch(body, "^Exception \\(Exception Code: (?P<tclogger_exception_code>0x[0-9a-fA-F]+), (?P<tclogger_exception_reason>[^)]+)\\) in PLC Application (?P<tclogger_plc_application>\\S+) Instance, Task (?P<tclogger_task>\\S+) \\(RBP: (?P<tclogger_rbp>0x[0-9a-fA-F]+), RIP: (?P<tclogger_rip>0x[0-9a-fA-F]+), RSP: (?P<tclogger_rsp>0x[0-9a-fA-F]+)\\), Area (?P<tclogger_area>\\d+), Offset (?P<tclogger_offset>0x[0-9a-fA-F]+)$")'
+          - 'set(attributes["tclogger_category"], "faults") where IsMatch(body, "^Exception \\(Exception Code: (?P<tclogger_exception_code>0x[0-9a-fA-F]+), (?P<tclogger_exception_reason>[^)]+)\\) in PLC Application (?P<tclogger_plc_application>\\S+) Instance, Task (?P<tclogger_task>\\S+) \\(RBP: (?P<tclogger_rbp>0x[0-9a-fA-F]+), RIP: (?P<tclogger_rip>0x[0-9a-fA-F]+), RSP: (?P<tclogger_rsp>0x[0-9a-fA-F]+)\\), Area (?P<tclogger_area>\\d+), Offset (?P<tclogger_offset>0x[0-9a-fA-F]+)$")'
+          - 'set(attributes["tclogger_matched"], true) where IsMatch(body, "^Exception \\(Exception Code: (?P<tclogger_exception_code>0x[0-9a-fA-F]+), (?P<tclogger_exception_reason>[^)]+)\\) in PLC Application (?P<tclogger_plc_application>\\S+) Instance, Task (?P<tclogger_task>\\S+) \\(RBP: (?P<tclogger_rbp>0x[0-9a-fA-F]+), RIP: (?P<tclogger_rip>0x[0-9a-fA-F]+), RSP: (?P<tclogger_rsp>0x[0-9a-fA-F]+)\\), Area (?P<tclogger_area>\\d+), Offset (?P<tclogger_offset>0x[0-9a-fA-F]+)$")'
+
+
+          # ---- diagnostics ----
+          # 'TwinCAT IoT Data Agent': File "C:\ProgramData\Beckhoff\TwinCAT\3.1\Boot\TcIoTDataAgentConfig.xml" not found.
+          - 'merge_maps(attributes, ExtractPatterns(body, "^''TwinCAT IoT Data Agent'': File \"(?P<tclogger_file>[^\"]+)\" not found\\.$"), "insert") where IsMatch(body, "^''TwinCAT IoT Data Agent'': File \"(?P<tclogger_file>[^\"]+)\" not found\\.$")'
+          - 'set(attributes["tclogger_pattern"], "iot_data_agent_file_not_found") where IsMatch(body, "^''TwinCAT IoT Data Agent'': File \"(?P<tclogger_file>[^\"]+)\" not found\\.$")'
+          - 'set(attributes["tclogger_category"], "diagnostics") where IsMatch(body, "^''TwinCAT IoT Data Agent'': File \"(?P<tclogger_file>[^\"]+)\" not found\\.$")'
+          - 'set(attributes["tclogger_matched"], true) where IsMatch(body, "^''TwinCAT IoT Data Agent'': File \"(?P<tclogger_file>[^\"]+)\" not found\\.$")'
+
+          # 'TwinCAT System' (10000): TwinCAT System Service Control Message: SYSTEM STOP.
+          - 'merge_maps(attributes, ExtractPatterns(body, "^''TwinCAT System'' \\((?P<tclogger_id>\\d+)\\): TwinCAT System Service Control Message: (?P<tclogger_message>.+)\\.$"), "insert") where IsMatch(body, "^''TwinCAT System'' \\((?P<tclogger_id>\\d+)\\): TwinCAT System Service Control Message: (?P<tclogger_message>.+)\\.$")'
+          - 'set(attributes["tclogger_pattern"], "system_service_control_message") where IsMatch(body, "^''TwinCAT System'' \\((?P<tclogger_id>\\d+)\\): TwinCAT System Service Control Message: (?P<tclogger_message>.+)\\.$")'
+          - 'set(attributes["tclogger_category"], "diagnostics") where IsMatch(body, "^''TwinCAT System'' \\((?P<tclogger_id>\\d+)\\): TwinCAT System Service Control Message: (?P<tclogger_message>.+)\\.$")'
+          - 'set(attributes["tclogger_matched"], true) where IsMatch(body, "^''TwinCAT System'' \\((?P<tclogger_id>\\d+)\\): TwinCAT System Service Control Message: (?P<tclogger_message>.+)\\.$")'
+
+          # The logging of messages has been temporarily halted because too many messages
+          # have been issued! This can lead to a loss of messages.
+          # (TwinCAT's own logger self-throttling when flooded - no fields to extract.)
+          - 'set(attributes["tclogger_pattern"], "logger_throttled") where body == "The logging of messages has been temporarily halted because too many messages have been issued! This can lead to a loss of messages."'
+          - 'set(attributes["tclogger_category"], "diagnostics") where body == "The logging of messages has been temporarily halted because too many messages have been issued! This can lead to a loss of messages."'
+          - 'set(attributes["tclogger_matched"], true) where body == "The logging of messages has been temporarily halted because too many messages have been issued! This can lead to a loss of messages."'
