@@ -253,10 +253,12 @@ func (c *Config) Validate() error {
 // toBridgeConfig converts the receiver Config to the shared adsbridge.Config.
 func (c *Config) toBridgeConfig() adsbridge.Config {
 	return adsbridge.Config{
-		TargetNetID:          c.TargetNetID,
-		RouterAddr:           c.RouterAddr,
-		RouterPort:           c.RouterPort,
-		PLCPort:              c.PLCPort,
-		StatePollingInterval: c.StatePollingInterval,
+		TargetNetID:                 c.TargetNetID,
+		RouterAddr:                  c.RouterAddr,
+		RouterPort:                  c.RouterPort,
+		PLCPort:                     c.PLCPort,
+		StatePollingInterval:        c.StatePollingInterval,
+		ConnectRetryInitialInterval: c.ConnectRetryInitialInterval,
+		ConnectRetryMaxInterval:     c.ConnectRetryMaxInterval,
 	}
 }

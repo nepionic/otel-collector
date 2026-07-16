@@ -31,14 +31,25 @@ type Config struct {
 	// StatePollingInterval controls how often the ADS client polls TwinCAT state
 	// for restart detection (default 2s).
 	StatePollingInterval time.Duration `mapstructure:"state_polling_interval"`
+	// ConnectRetryInitialInterval is the first backoff interval used both for
+	// the initial connect and when dialing a fresh connection to replace a
+	// wedged one (default 1s).
+	ConnectRetryInitialInterval time.Duration `mapstructure:"connect_retry_initial_interval"`
+	// ConnectRetryMaxInterval caps that backoff, and also bounds how long
+	// onConnectionLost tolerates consecutive ReadTcSystemState failures before
+	// concluding the TCP session itself is wedged and forcing a fresh one
+	// (default 30s).
+	ConnectRetryMaxInterval time.Duration `mapstructure:"connect_retry_max_interval"`
 }
 
 // DefaultConfig returns a Config populated with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		RouterPort:           48898,
-		PLCPort:              851,
-		StatePollingInterval: 2 * time.Second,
+		RouterPort:                  48898,
+		PLCPort:                     851,
+		StatePollingInterval:        2 * time.Second,
+		ConnectRetryInitialInterval: time.Second,
+		ConnectRetryMaxInterval:     30 * time.Second,
 	}
 }
 
@@ -161,6 +172,15 @@ func IsNetworkError(err error) bool {
 // callback. It runs in a goroutine spawned by ads-go, polling until TwinCAT
 // returns to Run state and then calling reconnectFn in a retry loop until it
 // succeeds (handles the case where symbols aren't deployed yet on restart).
+//
+// A TwinCAT restart-index bump doesn't necessarily drop the underlying TCP
+// session to the router - the router itself can keep running across a PLC
+// config activation/restart. If that session survives but stops actually
+// responding (observed in practice: ReadTcSystemState timing out forever,
+// never a clean EOF/reset IsNetworkError would catch), polling it would
+// otherwise continue indefinitely with no path back to Run state. Once
+// consecutive read failures exceed ConnectRetryMaxInterval, this gives up on
+// the existing session and dials a fresh one via reconnectTCP.
 func (mc *ManagedClient) onConnectionLost(client *ads.Client, err error) {
 	mc.zapLogger.Warn("ADS connection lost – waiting for TwinCAT Run state",
 		zap.Error(err),
@@ -179,6 +199,8 @@ func (mc *ManagedClient) onConnectionLost(client *ads.Client, err error) {
 	tick := time.NewTicker(mc.cfg.StatePollingInterval)
 	defer tick.Stop()
 
+	var firstReadFailureAt time.Time
+
 	for {
 		select {
 		case <-done:
@@ -194,7 +216,33 @@ func (mc *ManagedClient) onConnectionLost(client *ads.Client, err error) {
 		// consecutive-failure path), and the state poller that would refresh it has
 		// been stopped. Using GetCurrentState() would loop forever on nil.
 		state, sErr := client.ReadTcSystemState()
-		if sErr != nil || state.AdsState != 5 {
+		if sErr != nil {
+			if firstReadFailureAt.IsZero() {
+				firstReadFailureAt = time.Now()
+			}
+			if time.Since(firstReadFailureAt) < mc.cfg.ConnectRetryMaxInterval {
+				continue
+			}
+
+			mc.zapLogger.Warn("ReadTcSystemState has failed continuously past the retry ceiling; the TCP session is likely wedged, dialing a fresh one",
+				zap.Duration("stuck_for", time.Since(firstReadFailureAt)),
+				zap.String("target_net_id", mc.cfg.TargetNetID),
+				zap.Error(sErr),
+			)
+			client = mc.reconnectTCP(done)
+			if client == nil {
+				// done fired (client replaced/torn down elsewhere) while we were
+				// dialing - another goroutine now owns reconnection, or the
+				// receiver is shutting down.
+				return
+			}
+			done = mc.lostDone
+			firstReadFailureAt = time.Time{}
+			continue
+		}
+		firstReadFailureAt = time.Time{}
+
+		if state.AdsState != 5 {
 			continue
 		}
 
@@ -217,6 +265,57 @@ func (mc *ManagedClient) onConnectionLost(client *ads.Client, err error) {
 			zap.String("target_net_id", mc.cfg.TargetNetID),
 		)
 		return
+	}
+}
+
+// reconnectTCP tears down a wedged ads.Client (Reset) and dials a fresh one,
+// retrying with the same exponential backoff used for the initial connect.
+// Returns the new, connected client, or nil if prevDone fires while dialing
+// (the client was replaced or the receiver is shutting down elsewhere, so the
+// caller should stop rather than keep managing a client it no longer owns).
+func (mc *ManagedClient) reconnectTCP(prevDone chan struct{}) *ads.Client {
+	select {
+	case <-prevDone:
+		return nil
+	default:
+	}
+	mc.Reset()
+	done := mc.lostDone
+
+	backoff := mc.cfg.ConnectRetryInitialInterval
+	if backoff <= 0 {
+		backoff = time.Second
+	}
+	maxBackoff := mc.cfg.ConnectRetryMaxInterval
+	if maxBackoff <= 0 {
+		maxBackoff = 30 * time.Second
+	}
+
+	for {
+		client := mc.Client()
+		if cErr := client.Connect(); cErr != nil {
+			mc.zapLogger.Warn("Fresh ADS connect failed, retrying",
+				zap.Duration("retry_in", backoff),
+				zap.String("target_net_id", mc.cfg.TargetNetID),
+				zap.Error(cErr),
+			)
+			select {
+			case <-done:
+				return nil
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			mc.Reset()
+			done = mc.lostDone
+			continue
+		}
+		mc.zapLogger.Info("Dialed fresh ADS connection after wedged session",
+			zap.String("target_net_id", mc.cfg.TargetNetID),
+		)
+		return client
 	}
 }
 
