@@ -109,6 +109,9 @@ processors:
       # - key: machine.id
       #   value: "${env:MACHINE_ID}"
       #   action: upsert
+      - key: service.type
+        value: "operational"
+        action: upsert
 
 exporters:
   # Send everything to an OTLP-compatible backend (Grafana, Jaeger, etc.)
@@ -123,6 +126,14 @@ exporters:
 
 service:
   extensions: [zpages]
+
+  telemetry:
+    resource:
+      attributes:
+        - name: service.name
+          value: otelcol-ads
+        - name: service.type
+          value: "monitoring"
 
   pipelines:
     logs:
