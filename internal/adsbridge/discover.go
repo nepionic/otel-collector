@@ -78,10 +78,9 @@ func FindLogRingSymbol(client *ads.Client, port uint16) (string, error) {
 //     attribute {attribute 'otelcol_role' := 'metric_ring'}.
 //
 //  2. Type-based (fallback): scan the symbol table for a symbol whose type
-//     name ends with "OTelMetricRing" (case-insensitive) and return it
-//     directly. Unlike the log ring (a field owned by OTelLogAppender), the
-//     metric ring is a standalone variable that the PLC project assigns into
-//     OTelMetricCore via its Ring property, so no field suffix is appended.
+//     name ends with "OTelMetricCore" (case-insensitive) and append ".ring".
+//     OTelMetricCore owns its ring directly (like OTelLogAppender owns
+//     OTelLogRing), so the ring field is always named "ring" inside it.
 //
 // Returns ErrSymbolNotFound (wrapped) if neither strategy succeeds.
 func FindMetricRingSymbol(client *ads.Client, port uint16) (string, error) {
@@ -99,12 +98,12 @@ func FindMetricRingSymbol(client *ads.Client, port uint16) (string, error) {
 		}
 	}
 
-	// Strategy 2: find a variable declared as (namespace-qualified) OTelMetricRing.
+	// Strategy 2: find an OTelMetricCore instance and derive the ring path.
 	for _, s := range syms {
-		if strings.HasSuffix(strings.ToLower(s.Type), "otelmetricring") {
-			return s.Name, nil
+		if strings.HasSuffix(strings.ToLower(s.Type), "otelmetriccore") {
+			return s.Name + ".ring", nil
 		}
 	}
 
-	return "", fmt.Errorf("no OTelMetricRing or otelcol_role=metric_ring symbol found: %w", ErrSymbolNotFound)
+	return "", fmt.Errorf("no OTelMetricCore or otelcol_role=metric_ring symbol found: %w", ErrSymbolNotFound)
 }
