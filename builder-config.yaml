@@ -22,12 +22,15 @@ dist:
 extensions:
   - gomod: go.opentelemetry.io/collector/extension/zpagesextension v0.149.0
   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/basicauthextension v0.149.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/healthcheckextension v0.149.0
 
 receivers:
   - gomod: github.com/nepionic/otelcol-ads v0.1.0
     import: github.com/nepionic/otelcol-ads/receiver/adsreceiver
     name: adsreceiver
     path: ./
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/windowseventlogreceiver v0.149.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver v0.149.0
 
 exporters:
   - gomod: go.opentelemetry.io/collector/exporter/otlpexporter v0.149.0
