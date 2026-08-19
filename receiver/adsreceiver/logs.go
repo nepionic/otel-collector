@@ -12,7 +12,7 @@ import (
 	adsstateinfo "github.com/jarmocluyse/ads-go/pkg/ads/ads-stateinfo"
 	adstypes "github.com/jarmocluyse/ads-go/pkg/ads/types"
 	"github.com/nepionic/otelcol-ads/internal/adsbridge"
-	adslogger "github.com/siyka-au/ads-logger/pkg/ads-logger"
+	adslogger "github.com/nepionic/ads-logger/pkg/ads-logger"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"

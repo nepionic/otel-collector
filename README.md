@@ -16,8 +16,8 @@ A custom [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/) dis
 |---|---|---|
 | [Go](https://go.dev/dl/) | 1.25+ | Required to build from source. |
 | [OTel Collector Builder (`ocb`)](https://github.com/open-telemetry/opentelemetry-collector/tree/main/cmd/builder) | 0.149.0 | Used to assemble the collector binary. |
-| [ads-go](https://github.com/jarmocluyse/ads-go) | local clone | ADS client library; pulled from a sibling workspace path (see below). |
-| [ads-logger](https://github.com/siyka-au/ads-logger) | local clone | TwinCAT system logger (ADS port 100) client; pulled from a sibling workspace path (see below). |
+| [ads-go](https://github.com/siyka-au/ads-go) | local clone | ADS client library; pulled from a sibling workspace path (see below). Fork of [jarmocluyse/ads-go](https://github.com/jarmocluyse/ads-go) with local changes not yet upstreamed. |
+| [ads-logger](https://github.com/nepionic/ads-logger) | local clone | TwinCAT system logger (ADS port 100) client; pulled from a sibling workspace path (see below). |
 
 ---
 
@@ -27,20 +27,21 @@ This repository uses a `go.work` file that references local clones of **ads-go**
 
 ```
 workspaces/
-├── nepionic/otel/          ← this repo
+├── nepionic/
+│   ├── otel/               ← this repo
+│   └── ads-logger/         ← ads-logger dependency (local)
 └── siyka/
-    ├── ads-go/             ← ads-go dependency (local)
-    └── ads-logger/         ← ads-logger dependency (local)
+    └── ads-go/             ← ads-go dependency (local)
 ```
 
 1. Clone all three repositories:
 
    ```sh
-   # ads-go dependency
-   git clone https://github.com/jarmocluyse/ads-go path/to/siyka/ads-go
+   # ads-go dependency (siyka-au fork, with local changes not yet upstreamed)
+   git clone https://github.com/siyka-au/ads-go path/to/siyka/ads-go
 
    # ads-logger dependency
-   git clone https://github.com/siyka-au/ads-logger path/to/siyka/ads-logger
+   git clone https://github.com/nepionic/ads-logger path/to/nepionic/ads-logger
 
    # this repo
    git clone <otelcol-ads-repo-url> path/to/nepionic/otel
@@ -53,7 +54,7 @@ workspaces/
        .
        ./dist
        ../../siyka/ads-go       # ← adjust if your directory layout differs
-       ../../siyka/ads-logger   # ← adjust if your directory layout differs
+       ../ads-logger            # ← adjust if your directory layout differs
    )
    ```
 

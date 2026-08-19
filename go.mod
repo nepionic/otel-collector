@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/jarmocluyse/ads-go v0.2.4
-	github.com/siyka-au/ads-logger v0.0.0
+	github.com/nepionic/ads-logger v0.0.0
 	github.com/stretchr/testify v1.11.1
 	go.opentelemetry.io/collector/component v1.62.0
 	go.opentelemetry.io/collector/confmap v1.62.0
