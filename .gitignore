@@ -23,6 +23,7 @@ config*.yaml
 
 # Local builder overrides (machine-specific replace directives)
 builder-config.local.yaml
+merged.yaml
 
 # Log output from local runs
 logs/
